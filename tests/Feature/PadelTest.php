@@ -223,11 +223,45 @@ class PadelTest extends TestCase
         $this->assertSame(0, $state['winner']);
     }
 
+    public function test_first_to_target_super_tiebreak_finishes_for_either_team_at_custom_targets(): void
+    {
+        foreach ([7, 10, 21] as $target) {
+            foreach ([0, 1] as $winner) {
+                $rules = [...ScoringEngine::defaults(), 'super_points' => $target, 'super_win_by_two' => false];
+                $state = $this->points((new ScoringEngine)->initial(), 0, 24, $rules);
+                $state = $this->points($state, 1, 24, $rules);
+                $this->assertSame('super', $state['mode']);
+                $state = $this->points($state, 0, $target - 1, $rules);
+                $state = $this->points($state, 1, $target - 1, $rules);
+                $this->assertNull($state['winner']);
+                $state = $this->points($state, $winner, 1, $rules);
+                $this->assertSame($winner, $state['winner']);
+                $this->assertSame($target, $state['sets'][2]['games'][$winner]);
+                $this->assertSame($target - 1, $state['sets'][2]['games'][1 - $winner]);
+                $this->assertSame($state, $this->points($state, 1 - $winner, 1, $rules));
+            }
+        }
+    }
+
+    public function test_legacy_super_tiebreak_still_requires_two_point_lead(): void
+    {
+        $rules = ScoringEngine::defaults();
+        unset($rules['super_win_by_two']);
+        $state = (new ScoringEngine)->initial();
+        $state['mode'] = 'super';
+        $state['points'] = [9, 9];
+        $state = $this->points($state, 1, 1, $rules);
+        $this->assertNull($state['winner']);
+        $state = $this->points($state, 1, 1, $rules);
+        $this->assertSame(1, $state['winner']);
+        $this->assertSame([9, 11], $state['sets'][0]['games']);
+    }
+
     public function test_custom_tiebreak_rules_persist_to_presets_tiers_and_matches(): void
     {
         $this->account();
-        $rules = [...ScoringEngine::defaults(), 'tiebreak_at' => 5, 'tiebreak_win_by_two' => false];
-        $this->postJson('/api/v1/presets', ['name' => 'First to seven', 'rules' => $rules])->assertCreated()->assertJsonPath('rules.tiebreak_at', 5)->assertJsonPath('rules.tiebreak_win_by_two', false);
+        $rules = [...ScoringEngine::defaults(), 'tiebreak_at' => 5, 'tiebreak_win_by_two' => false, 'super_win_by_two' => false];
+        $this->postJson('/api/v1/presets', ['name' => 'First to seven', 'rules' => $rules])->assertCreated()->assertJsonPath('rules.tiebreak_at', 5)->assertJsonPath('rules.tiebreak_win_by_two', false)->assertJsonPath('rules.super_win_by_two', false);
         $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Short Set']);
         $this->postJson('/api/v1/tiers', ['tournament_id' => $tournament->id, 'name' => 'Short', 'format' => 'direct', 'rules' => $rules, 'groups' => [['name' => 'Final', 'teams' => ['One', 'Two']]]])->assertCreated();
         foreach ($rules as $key => $value) {
@@ -236,6 +270,7 @@ class PadelTest extends TestCase
         }
         $this->postJson('/api/v1/presets', ['name' => 'Invalid trigger', 'rules' => [...$rules, 'tiebreak_at' => 7]])->assertUnprocessable()->assertJsonValidationErrors('rules.tiebreak_at');
         $this->postJson('/api/v1/presets', ['name' => 'Invalid margin', 'rules' => [...$rules, 'tiebreak_win_by_two' => 'invalid']])->assertUnprocessable()->assertJsonValidationErrors('rules.tiebreak_win_by_two');
+        $this->postJson('/api/v1/presets', ['name' => 'Invalid super margin', 'rules' => [...$rules, 'super_win_by_two' => 'invalid']])->assertUnprocessable()->assertJsonValidationErrors('rules.super_win_by_two');
     }
 
     public function test_scoring_is_versioned_idempotent_and_undoable(): void

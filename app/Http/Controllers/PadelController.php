@@ -144,6 +144,7 @@ class PadelController extends Controller
             'rules.tiebreak_win_by_two' => 'sometimes|boolean',
             'rules.tiebreak_points' => 'required|integer|min:5|max:21',
             'rules.super_points' => 'required|integer|min:7|max:21',
+            'rules.super_win_by_two' => 'sometimes|boolean',
         ])['rules'];
     }
 

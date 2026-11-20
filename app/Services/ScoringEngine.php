@@ -6,7 +6,7 @@ class ScoringEngine
 {
     public static function defaults(): array
     {
-        return ['regular_sets' => 2, 'games_to_win' => 6, 'golden_point' => false, 'tiebreak_points' => 7, 'tiebreak_win_by_two' => true, 'super_points' => 10];
+        return ['regular_sets' => 2, 'games_to_win' => 6, 'golden_point' => false, 'tiebreak_points' => 7, 'tiebreak_win_by_two' => true, 'super_points' => 10, 'super_win_by_two' => true];
     }
 
     public function initial(int $server = 0): array
@@ -24,7 +24,7 @@ class ScoringEngine
         [$a, $b] = [$state['points'][$team], $state['points'][$other]];
         if ($state['mode'] !== 'regular') {
             $target = $state['mode'] === 'super' ? $rules['super_points'] : $rules['tiebreak_points'];
-            $winByTwo = $state['mode'] === 'super' || ($rules['tiebreak_win_by_two'] ?? true);
+            $winByTwo = $state['mode'] === 'super' ? ($rules['super_win_by_two'] ?? true) : ($rules['tiebreak_win_by_two'] ?? true);
             if ($a >= $target && (! $winByTwo || $a - $b >= 2)) {
                 $points = $state['points'];
                 $state['server'] = ($state['game_server'] + 1) % 4;
