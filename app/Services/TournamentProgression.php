@@ -7,6 +7,7 @@ use App\Models\CourtReservation;
 use App\Models\PadelMatch;
 use App\Models\Tier;
 use App\Models\Tournament;
+use Illuminate\Support\Facades\DB;
 
 class TournamentProgression
 {
@@ -57,13 +58,26 @@ class TournamentProgression
         return new PadelMatch(['id' => -$reservation->id, 'reservation_id' => $reservation->id, 'tier_id' => $tier->id, 'court_id' => $reservation->court_id, 'queue_position' => $reservation->queue_position, 'group_name' => $fixture['round_name'].' · '.$fixture['number'], 'team_a' => $fixture['team_a'] ?? $fixture['label_a'], 'team_b' => $fixture['team_b'] ?? $fixture['label_b'], 'status' => 'waiting', 'stage' => 'knockout', 'version' => $reservation->version, 'rules' => $tier->rules, 'state' => (new ScoringEngine)->initial()]);
     }
 
+    public function canEditDraw(Tier $tier): bool
+    {
+        $matches = PadelMatch::where('tier_id', $tier->id)->get();
+
+        return $tier->format === 'knockout' && ! $matches->contains(fn (PadelMatch $match): bool => $match->status !== 'scheduled' || $match->started_at !== null)
+            && ! DB::table('score_events')->whereIn('padel_match_id', $matches->pluck('id'))->exists();
+    }
+
+    public function drawRevision(Tier $tier): string
+    {
+        return hash('sha256', json_encode([$tier->groups, $tier->rules, $tier->knockout, PadelMatch::where('tier_id', $tier->id)->orderBy('id')->get(['id', 'version', 'status', 'started_at'])->toArray()]));
+    }
+
     public function overview(Tier $tier): array
     {
         $config = $tier->knockout ?? [];
         if ($tier->format === 'knockout') {
             $rounds = $config['rounds'] ?? $this->directDraw($tier);
 
-            return ['revision' => hash('sha256', json_encode([$tier->groups, $rounds, $tier->rules])), 'tie_orders' => (object) [], 'qualifiers' => 0, 'complete' => true, 'ready' => true, 'finished' => 0, 'total' => 0, 'groups' => [], 'rounds' => $rounds, 'confirmed_at' => $config['confirmed_at'] ?? null];
+            return ['can_edit_draw' => $this->canEditDraw($tier), 'draw_revision' => $this->drawRevision($tier), 'revision' => hash('sha256', json_encode([$tier->groups, $rounds, $tier->rules])), 'tie_orders' => (object) [], 'qualifiers' => 0, 'complete' => true, 'ready' => true, 'finished' => 0, 'total' => 0, 'groups' => [], 'rounds' => $rounds, 'confirmed_at' => $config['confirmed_at'] ?? null];
         }
         $qualifiers = $config['qualifiers'] ?? 2;
         $matches = PadelMatch::where('tier_id', $tier->id)->where('stage', 'group')->orderBy('id')->get();
@@ -202,7 +216,7 @@ class TournamentProgression
 
     private function directDraw(Tier $tier): array
     {
-        if (($tier->knockout['draw_mode'] ?? null) === 'seeded') {
+        if (in_array($tier->knockout['draw_mode'] ?? null, ['seeded', 'manual'], true)) {
             return $this->rounds($tier->knockout['draw_slots']);
         }
         $teams = $tier->groups[0]['teams'];

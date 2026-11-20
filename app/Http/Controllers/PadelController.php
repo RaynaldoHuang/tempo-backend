@@ -207,7 +207,7 @@ class PadelController extends Controller
     {
         $data = $request->validate([
             'tournament_id' => 'required|exists:tournaments,id', 'name' => 'required|string|max:100',
-            'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random,seeded', 'groups' => 'required|array|min:1|max:16',
+            'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random,seeded,manual', 'groups' => 'required|array|min:1|max:16',
             'groups.*.name' => 'required|string|max:50|distinct',
             'groups.*.teams' => 'required|array|min:2|max:'.($request->input('format') === 'knockout' ? 64 : 16),
             'groups.*.teams.*' => 'required|string|max:100',
@@ -255,6 +255,7 @@ class PadelController extends Controller
         $this->admin($request);
         $data = $this->validateTier($request);
         $drawMode = $data['draw_mode'] ?? 'ordered';
+        abort_if($drawMode === 'manual', 422, 'Simpan peserta terlebih dahulu, lalu atur pertemuan melalui halaman Bagan.');
         $seeds = $drawMode === 'seeded' ? $data['seeds'] : [];
         unset($data['draw_mode'], $data['seeds']);
         if ($data['format'] === 'knockout' && $drawMode === 'random') {
@@ -295,6 +296,7 @@ class PadelController extends Controller
                 throw ValidationException::withMessages(['seeds' => 'Pilih kembali pasangan unggulan dari peserta knockout.']);
             }
             $structuralChange = (int) $data['tournament_id'] !== $locked->tournament_id || $data['format'] !== $locked->format || $data['groups'] != $locked->groups || ($data['format'] === 'knockout' && ($drawMode !== ($locked->knockout['draw_mode'] ?? 'ordered') || ($drawMode === 'seeded' && $seeds !== ($locked->knockout['seeds'] ?? []))));
+            abort_if($structuralChange && $drawMode === 'manual', 422, 'Ubah pertemuan melalui halaman Bagan, atau pilih mode susunan lain untuk mengganti peserta.');
             $rulesChanged = $data['rules'] != $locked->rules;
             unset($data['draw_mode'], $data['seeds']);
             if ($structuralChange && $data['format'] === 'knockout' && $drawMode === 'random') {
@@ -327,6 +329,69 @@ class PadelController extends Controller
         abort_unless(in_array($tier->format, ['group', 'knockout'], true), 422, 'Tier ini tidak menggunakan bagan knockout.');
 
         return response()->json($progression->overview($tier));
+    }
+
+    public function manualDraw(Request $request, Tier $tier, TournamentProgression $progression): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['revision' => 'required|string|size:64', 'slots' => 'required|array|list|min:2|max:64', 'slots.*' => 'nullable|string|max:100']);
+        DB::transaction(function () use ($tier, $data, $progression): void {
+            $locked = Tier::whereKey($tier->id)->lockForUpdate()->firstOrFail();
+            abort_unless($locked->format === 'knockout', 422, 'Pengaturan ini untuk knockout langsung.');
+            PadelMatch::where('tier_id', $locked->id)->lockForUpdate()->get();
+            abort_unless($progression->canEditDraw($locked), 409, 'Bagan tidak dapat diubah setelah pertandingan dimulai atau skor dicatat.');
+            abort_unless($data['revision'] === $progression->drawRevision($locked), 409, 'Bagan berubah. Tutup pengaturan lalu buka kembali.');
+            $size = 2;
+            while ($size < count($locked->groups[0]['teams'])) {
+                $size *= 2;
+            }
+            $teams = array_values(array_filter($data['slots'], fn (?string $team): bool => $team !== null));
+            if (count($data['slots']) !== $size || count($teams) !== count($locked->groups[0]['teams']) || count(array_unique($teams)) !== count($teams) || array_diff($teams, $locked->groups[0]['teams'])) {
+                throw ValidationException::withMessages(['slots' => 'Tempatkan setiap pasangan tepat satu kali. Jumlah slot dan BYE harus sesuai ukuran bagan.']);
+            }
+            for ($i = 0; $i < $size; $i += 2) {
+                if ($data['slots'][$i] === null && $data['slots'][$i + 1] === null) {
+                    throw ValidationException::withMessages(['slots' => 'Satu pertandingan tidak boleh berisi BYE melawan BYE.']);
+                }
+            }
+            $assignments = [];
+            foreach (CourtReservation::where('tier_id', $locked->id)->get() as $entry) {
+                $assignments[$entry->round.':'.$entry->position] = ['court_id' => $entry->court_id, 'queue_position' => $entry->queue_position];
+            }
+            $oldRounds = $progression->overview($locked)['rounds'];
+            foreach ($oldRounds as $r => $round) {
+                foreach ($round['matches'] as $i => $node) {
+                    $match = $node['match_id'] ? PadelMatch::find($node['match_id']) : null;
+                    if ($match?->court_id) {
+                        $assignments["{$r}:{$i}"] = ['court_id' => $match->court_id, 'queue_position' => $match->queue_position];
+                    }
+                }
+            }
+            foreach (collect($assignments)->pluck('court_id')->unique()->sort() as $courtId) {
+                Court::whereKey($courtId)->lockForUpdate()->firstOrFail();
+            }
+            $slots = array_map(fn (?string $team, int $i): array => ['label' => $team === null ? 'BYE' : 'Slot '.($i + 1), 'team' => $team], $data['slots'], array_keys($data['slots']));
+            $locked->update(['knockout' => ['draw_mode' => 'manual', 'draw_slots' => $slots, 'schedule' => []]]);
+            PadelMatch::where('tier_id', $locked->id)->delete();
+            CourtReservation::where('tier_id', $locked->id)->delete();
+            $config = $locked->knockout;
+            $rounds = $progression->overview($locked)['rounds'];
+            foreach ($assignments as $key => $assignment) {
+                [$r, $i] = array_map('intval', explode(':', $key));
+                if (! isset($rounds[$r]['matches'][$i]) || $rounds[$r]['matches'][$i]['bye']) {
+                    continue;
+                }
+                $court = Court::find($assignment['court_id']);
+                if (! $court || $court->venue_id !== Tournament::findOrFail($locked->tournament_id)->venue_id) {
+                    continue;
+                }
+                CourtReservation::create(['tier_id' => $locked->id, 'round' => $r, 'position' => $i, ...$assignment, 'queue_position' => $assignment['queue_position'] ?? (new CourtQueue)->nextPosition($court->id)]);
+                $config['schedule'][$key] = $court->id;
+            }
+            $locked->update(['knockout' => $config]);
+        }, 3);
+
+        return response()->json($progression->overview($tier->fresh()));
     }
 
     public function configureProgression(Request $request, Tier $tier): JsonResponse

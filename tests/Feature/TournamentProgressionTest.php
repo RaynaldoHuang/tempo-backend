@@ -379,6 +379,93 @@ class TournamentProgressionTest extends TestCase
         $this->assertNull($groupTier->fresh()->knockout);
     }
 
+    public function test_manual_draw_saves_exact_opponents_and_stays_stable_when_rules_change(): void
+    {
+        $this->account();
+        $tier = $this->directKnockout(16, 'random');
+        $url = "/api/v1/tiers/{$tier->id}";
+        $before = $this->getJson("{$url}/progression")->assertJsonPath('can_edit_draw', true)->json();
+        $slots = array_reverse($tier->groups[0]['teams']);
+        $this->postJson("{$url}/draw", ['revision' => $before['draw_revision'], 'slots' => $slots])->assertOk()->assertJsonPath('rounds.0.matches.0.a.team', $slots[0])->assertJsonPath('rounds.0.matches.0.b.team', $slots[1])->assertJsonPath('confirmed_at', null);
+        $this->assertSame('manual', $tier->fresh()->knockout['draw_mode']);
+        $this->assertSame($slots, array_column($tier->fresh()->knockout['draw_slots'], 'team'));
+        $this->getJson("{$url}/progression")->assertJsonPath('rounds.0.matches.7.b.team', $slots[15]);
+        $row = collect($this->getJson('/api/v1/data')->json('tiers'))->firstWhere('id', $tier->id);
+        $this->patchJson($url, ['name' => $tier->name, 'tournament_id' => $tier->tournament_id, 'format' => 'knockout', 'draw_mode' => 'manual', 'groups' => $tier->groups, 'rules' => [...$tier->rules, 'super_win_by_two' => false], 'edit_revision' => $row['edit_revision']])->assertOk();
+        $this->assertSame($slots, array_column($tier->fresh()->knockout['draw_slots'], 'team'));
+        $this->postJson("{$url}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $matches = PadelMatch::where('tier_id', $tier->id)->orderBy('id')->get();
+        foreach ($matches as $i => $match) {
+            $this->assertSame($slots[$i * 2], $match->team_a);
+            $this->assertSame($slots[$i * 2 + 1], $match->team_b);
+        }
+    }
+
+    public function test_manual_draw_can_revise_unstarted_confirmed_draw_and_keep_slot_courts_and_queue(): void
+    {
+        $this->account();
+        $tier = $this->directKnockout(6);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $url = "/api/v1/tiers/{$tier->id}";
+        $this->postJson("{$url}/knockout", ['revision' => (new TournamentProgression)->overview($tier)['revision']])->assertOk();
+        $matches = PadelMatch::where('tier_id', $tier->id)->orderBy('id')->get();
+        foreach ($matches as $match) {
+            $this->postJson("/api/v1/matches/{$match->id}/assign", ['court_id' => $court->id])->assertOk();
+        }
+        $this->postJson("{$url}/knockout-schedule", ['round' => 2, 'position' => 0, 'court_id' => $court->id, 'revision' => (new TournamentProgression)->scheduleRevision($tier->fresh())])->assertOk();
+        $preview = $this->getJson("{$url}/progression")->assertJsonPath('can_edit_draw', true)->json();
+        $teams = $tier->groups[0]['teams'];
+        $slots = [null, $teams[5], $teams[3], $teams[1], $teams[4], null, $teams[2], $teams[0]];
+        $this->postJson("{$url}/draw", ['revision' => $preview['draw_revision'], 'slots' => $slots])->assertOk()->assertJsonPath('confirmed_at', null)->assertJsonPath('rounds.0.matches.0.a.team', null)->assertJsonPath('rounds.0.matches.0.b.team', $teams[5]);
+        $this->assertSame(0, PadelMatch::where('tier_id', $tier->id)->count());
+        $this->assertSame([1, 2, 3], CourtReservation::where('tier_id', $tier->id)->orderBy('queue_position')->pluck('queue_position')->all());
+        $this->postJson("{$url}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $rounds = $tier->fresh()->knockout['rounds'];
+        $this->assertSame($teams[5], $rounds[0]['matches'][0]['winner']);
+        $this->assertSame($teams[4], $rounds[0]['matches'][2]['winner']);
+        $freshMatches = PadelMatch::where('tier_id', $tier->id)->orderBy('queue_position')->get();
+        $this->assertSame([1, 2], $freshMatches->pluck('queue_position')->all());
+        $this->assertTrue($freshMatches->every(fn (PadelMatch $match): bool => $match->court_id === $court->id));
+        $this->assertSame(3, CourtReservation::where('tier_id', $tier->id)->first()->queue_position);
+    }
+
+    public function test_manual_draw_validates_every_participant_and_prevents_bye_against_bye(): void
+    {
+        $this->account();
+        $tier = $this->directKnockout(6);
+        $url = "/api/v1/tiers/{$tier->id}/draw";
+        $revision = (new TournamentProgression)->drawRevision($tier);
+        $teams = $tier->groups[0]['teams'];
+        foreach ([[$teams[0], $teams[0], ...array_slice($teams, 2), null, null], [...$teams, null, null], [...array_slice($teams, 0, 5), 'unknown', null, null], $teams] as $slots) {
+            $this->postJson($url, compact('revision', 'slots'))->assertUnprocessable()->assertJsonValidationErrors('slots');
+        }
+        $this->assertSame('ordered', $tier->fresh()->knockout['draw_mode']);
+        $this->assertDatabaseCount('padel_matches', 0);
+    }
+
+    public function test_manual_draw_rejects_stale_editor_referees_and_started_matches(): void
+    {
+        $this->account();
+        $tier = $this->directKnockout(4);
+        $url = "/api/v1/tiers/{$tier->id}";
+        $this->postJson("{$url}/knockout", ['revision' => (new TournamentProgression)->overview($tier)['revision']])->assertOk();
+        $slots = array_reverse($tier->groups[0]['teams']);
+        $revision = (new TournamentProgression)->drawRevision($tier->fresh());
+        $match = PadelMatch::where('tier_id', $tier->id)->first();
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $this->postJson("/api/v1/matches/{$match->id}/assign", ['court_id' => $court->id])->assertOk();
+        $this->postJson("{$url}/draw", compact('slots', 'revision'))->assertConflict();
+        $revision = (new TournamentProgression)->drawRevision($tier->fresh());
+        $this->account('referee');
+        $this->postJson("{$url}/draw", compact('slots', 'revision'))->assertForbidden();
+        $this->account();
+        $this->postJson("/api/v1/matches/{$match->id}/score", ['action' => 'start', 'server' => 0, 'version' => $match->fresh()->version, 'command_id' => (string) Str::uuid()])->assertOk();
+        $this->getJson("{$url}/progression")->assertJsonPath('can_edit_draw', false);
+        $this->postJson("{$url}/draw", ['slots' => $slots, 'revision' => (new TournamentProgression)->drawRevision($tier->fresh())])->assertConflict();
+        $this->assertSame('ordered', $tier->fresh()->knockout['draw_mode']);
+        $this->assertSame('live', $match->fresh()->status);
+    }
+
     public function test_seeded_sixteen_draw_locks_exact_reference_positions_and_survives_rule_edits(): void
     {
         $this->account();
