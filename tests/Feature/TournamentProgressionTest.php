@@ -7,6 +7,7 @@ use App\Models\PadelMatch;
 use App\Models\Tier;
 use App\Models\Tournament;
 use App\Models\User;
+use App\Models\Venue;
 use App\Services\ScoringEngine;
 use App\Services\TournamentProgression;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -31,7 +32,7 @@ class TournamentProgressionTest extends TestCase
             $name = chr(65 + $i);
             $groups[] = ['name' => "Grup {$name}", 'teams' => ["{$name}1", "{$name}2"]];
         }
-        $tier = Tier::create(['tournament_id' => Tournament::create(['name' => 'Knockout Open'])->id, 'name' => 'Bronze', 'format' => 'group', 'groups' => $groups, 'rules' => [...ScoringEngine::defaults(), 'regular_sets' => 1]]);
+        $tier = Tier::create(['tournament_id' => Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Knockout Open'])->id, 'name' => 'Bronze', 'format' => 'group', 'groups' => $groups, 'rules' => [...ScoringEngine::defaults(), 'regular_sets' => 1]]);
         foreach ($groups as $group) {
             $this->game($tier, $group['name'], $group['teams'][0], $group['teams'][1], 0, $finished ? 'finished' : 'scheduled');
         }
@@ -154,20 +155,20 @@ class TournamentProgressionTest extends TestCase
     {
         $tier = $this->tier();
         for ($i = 1; $i <= 7; $i++) {
-            Court::create(['name' => "Court {$i}"]);
+            Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => "Court {$i}"]);
         }
         $this->getJson('/api/v1/board')->assertOk()->assertJsonCount(7, 'courts')->assertJsonCount(2, 'standings')->assertJsonPath('standings.0.group_name', 'Grup A')->assertJsonPath('standings.0.rows.0.team', 'A1')->assertJsonPath('standings.0.rows.0.wins', 1)->assertJsonPath('standings.0.rows.0.games', 6)->assertJsonPath('standings.0.confirmed', false)->assertJsonMissingPath('standings.0.tie_orders')->assertJsonMissingPath('standings.0.knockout');
         $this->account();
         $this->postJson("/api/v1/tiers/{$tier->id}/knockout", ['revision' => (new TournamentProgression)->overview($tier)['revision']])->assertOk();
         $this->confirm(PadelMatch::where('stage', 'knockout')->first());
         $this->getJson('/api/v1/board')->assertJsonCount(0, 'standings')->assertJsonCount(1, 'knockouts')->assertJsonPath('knockouts.0.round_name', 'Semifinal')->assertJsonPath('knockouts.0.entries.0.winner', 'A1')->assertJsonMissingPath('knockouts.0.knockout');
-        Court::create(['name' => 'Court 8']);
+        Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Court 8']);
         $this->getJson('/api/v1/board')->assertJsonCount(8, 'courts')->assertJsonCount(0, 'standings')->assertJsonCount(0, 'knockouts');
     }
 
     private function directKnockout(int $size = 8, string $mode = 'ordered'): Tier
     {
-        $tournament = Tournament::create(['name' => 'Direct Open']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Direct Open']);
         $teams = array_map(fn (int $index): string => "Team {$index}", range(1, $size));
         $response = $this->postJson('/api/v1/tiers', ['tournament_id' => $tournament->id, 'name' => 'Silver', 'format' => 'knockout', 'draw_mode' => $mode, 'rules' => [...ScoringEngine::defaults(), 'regular_sets' => 1], 'groups' => [['name' => 'Peserta knockout', 'teams' => $teams]]])->assertCreated();
 
@@ -188,7 +189,7 @@ class TournamentProgressionTest extends TestCase
         $this->assertSame(4, PadelMatch::where('tier_id', $tier->id)->count());
         $this->assertSame(0, PadelMatch::where('tier_id', $tier->id)->where('stage', 'group')->count());
         $this->getJson('/api/v1/board')->assertJsonCount(2, 'standings')->assertJsonCount(1, 'knockouts')->assertJsonPath('knockouts.0.round_name', 'Perempat final')->assertJsonCount(4, 'knockouts.0.entries')->assertJsonPath('knockouts.0.entries.0.team_a', 'Team 1')->assertJsonPath('knockouts.0.entries.0.status', 'scheduled');
-        $court = Court::create(['name' => 'Court Silver']);
+        $court = Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Court Silver']);
         $first = PadelMatch::where('tier_id', $tier->id)->first();
         $first->update(['court_id' => $court->id, 'status' => 'live']);
         $state = $first->state;
@@ -235,7 +236,7 @@ class TournamentProgressionTest extends TestCase
     public function test_direct_knockout_validates_size_and_rejects_referee_confirmation(): void
     {
         $this->account();
-        $tournament = Tournament::create(['name' => 'Invalid Draw']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Invalid Draw']);
         $payload = ['tournament_id' => $tournament->id, 'name' => 'Invalid', 'format' => 'knockout', 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'List', 'teams' => array_map(fn (int $index): string => "Team {$index}", range(1, 17))]]];
         $this->postJson('/api/v1/tiers', $payload)->assertUnprocessable();
         $payload['groups'] = [['name' => 'A', 'teams' => ['A', 'B']], ['name' => 'B', 'teams' => ['C', 'D']]];

@@ -8,6 +8,7 @@ use App\Models\ScoringPreset;
 use App\Models\Tier;
 use App\Models\Tournament;
 use App\Models\User;
+use App\Models\Venue;
 use App\Services\ScoringEngine;
 use Database\Seeders\DatabaseSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -29,9 +30,9 @@ class PadelTest extends TestCase
 
     private function fixture(): PadelMatch
     {
-        $tournament = Tournament::create(['name' => 'Tempo Open']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Tempo Open']);
         $tier = Tier::create(['tournament_id' => $tournament->id, 'name' => 'Bronze', 'format' => 'group', 'groups' => [], 'rules' => ScoringEngine::defaults()]);
-        $court = Court::create(['name' => 'Court 1']);
+        $court = Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Court 1']);
 
         return PadelMatch::create(['tier_id' => $tier->id, 'court_id' => $court->id, 'queue_position' => 1, 'group_name' => 'A', 'team_a' => 'A1 / A2', 'team_b' => 'B1 / B2', 'state' => (new ScoringEngine)->initial(), 'rules' => ScoringEngine::defaults()]);
     }
@@ -160,7 +161,7 @@ class PadelTest extends TestCase
         $this->account();
         $rules = [...ScoringEngine::defaults(), 'tiebreak_at' => 5, 'tiebreak_win_by_two' => false];
         $this->postJson('/api/v1/presets', ['name' => 'First to seven', 'rules' => $rules])->assertCreated()->assertJsonPath('rules.tiebreak_at', 5)->assertJsonPath('rules.tiebreak_win_by_two', false);
-        $tournament = Tournament::create(['name' => 'Short Set']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Short Set']);
         $this->postJson('/api/v1/tiers', ['tournament_id' => $tournament->id, 'name' => 'Short', 'format' => 'direct', 'rules' => $rules, 'groups' => [['name' => 'Final', 'teams' => ['One', 'Two']]]])->assertCreated();
         foreach ($rules as $key => $value) {
             $this->assertSame($value, Tier::first()->rules[$key]);
@@ -196,7 +197,7 @@ class PadelTest extends TestCase
     {
         $this->account();
         $this->seed(DatabaseSeeder::class);
-        $tournament = Tournament::create(['name' => 'Tempo']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Tempo']);
         $this->postJson('/api/v1/tiers', ['tournament_id' => $tournament->id, 'name' => 'Bronze', 'format' => 'group', 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'A', 'teams' => ['One', 'Two', 'Three']]]])->assertCreated();
         $this->assertDatabaseCount('padel_matches', 3);
         $matches = PadelMatch::all();
@@ -240,7 +241,7 @@ class PadelTest extends TestCase
     {
         $this->account();
         $this->seed(DatabaseSeeder::class);
-        $tournament = Tournament::create(['name' => 'Seven Courts']);
+        $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Seven Courts']);
         $groups = [];
         for ($i = 1; $i <= 7; $i++) {
             $groups[] = ['name' => "Grup {$i}", 'teams' => ["A{$i}", "B{$i}"]];
@@ -324,12 +325,12 @@ class PadelTest extends TestCase
     public function test_admin_can_add_court_and_names_are_validated(): void
     {
         $this->account();
-        $response = $this->postJson('/api/v1/courts', ['name' => '  Court   Utama  '])->assertCreated()->assertJsonPath('name', 'Court Utama');
+        $response = $this->postJson('/api/v1/courts', ['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => '  Court   Utama  '])->assertCreated()->assertJsonPath('name', 'Court Utama');
         $id = $response->json('id');
         $this->getJson('/api/v1/board')->assertJsonPath('courts.0.id', $id);
         $this->getJson('/api/v1/data')->assertJsonPath('courts.0.name', 'Court Utama');
         foreach (['Court Utama', 'court utama', '   ', str_repeat('a', 101)] as $name) {
-            $this->postJson('/api/v1/courts', ['name' => $name])->assertUnprocessable();
+            $this->postJson('/api/v1/courts', ['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => $name])->assertUnprocessable();
         }
         $this->assertDatabaseCount('courts', 1);
     }
@@ -337,12 +338,12 @@ class PadelTest extends TestCase
     public function test_admin_can_delete_empty_court_and_release_referee_assignment(): void
     {
         $referee = User::factory()->create(['role' => 'referee']);
-        $court = Court::create(['name' => 'Empty', 'referee_id' => $referee->id]);
+        $court = Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Empty', 'referee_id' => $referee->id]);
         $this->account();
         $this->deleteJson("/api/v1/courts/{$court->id}")->assertOk();
         $this->assertDatabaseMissing('courts', ['id' => $court->id]);
         $this->assertDatabaseHas('users', ['id' => $referee->id]);
-        $replacement = Court::create(['name' => 'Replacement', 'referee_id' => $referee->id]);
+        $replacement = Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Replacement', 'referee_id' => $referee->id]);
         $this->getJson('/api/v1/board')->assertJsonCount(1, 'courts')->assertJsonPath('courts.0.id', $replacement->id);
         $this->deleteJson("/api/v1/courts/{$court->id}")->assertNotFound();
     }
@@ -377,7 +378,7 @@ class PadelTest extends TestCase
 
     public function test_only_admin_can_create_and_delete_courts(): void
     {
-        $court = Court::create(['name' => 'Protected']);
+        $court = Court::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Protected']);
         $this->postJson('/api/v1/courts', ['name' => 'New'])->assertUnauthorized();
         $this->deleteJson("/api/v1/courts/{$court->id}")->assertUnauthorized();
         $this->account('referee');

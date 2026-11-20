@@ -8,6 +8,7 @@ use App\Models\ScoringPreset;
 use App\Models\Tier;
 use App\Models\Tournament;
 use App\Models\User;
+use App\Models\Venue;
 use App\Services\ScoringEngine;
 use App\Services\TournamentProgression;
 use Illuminate\Http\JsonResponse;
@@ -66,7 +67,7 @@ class PadelController extends Controller
         }
 
         return response()->json([
-            'user' => $request->user(), 'courts' => $courts, 'matches' => $matches,
+            'venues' => Venue::orderBy('name')->get(), 'user' => $request->user(), 'courts' => $courts, 'matches' => $matches,
             'tournaments' => Tournament::orderByDesc('id')->get(), 'tiers' => Tier::all(),
             'presets' => ScoringPreset::all(),
             'referees' => $admin ? User::where('role', 'referee')->get(['id', 'name', 'email']) : [],
@@ -74,9 +75,11 @@ class PadelController extends Controller
         ]);
     }
 
-    public function board(TournamentProgression $progression): JsonResponse
+    public function board(Request $request, TournamentProgression $progression): JsonResponse
     {
-        $courts = Court::orderBy('id')->get()->map(function (Court $court): array {
+        $venueId = $request->validate(['venue_id' => 'sometimes|integer|exists:venues,id'])['venue_id'] ?? null;
+        $venues = Venue::orderBy('name')->get();
+        $courts = Court::when($venueId, fn ($query) => $query->where('venue_id', $venueId))->orderBy('id')->get()->map(function (Court $court) use ($venues): array {
             $matches = PadelMatch::where('court_id', $court->id)->queueOrder()->get();
             $pending = $matches->where('status', 'scheduled')->values();
             $current = $matches->first(fn (PadelMatch $match): bool => in_array($match->status, ['live', 'paused', 'review']))
@@ -87,7 +90,7 @@ class PadelController extends Controller
             $nextTier = $next ? Tier::find($next->tier_id) : null;
 
             return [
-                'id' => $court->id, 'name' => $court->name,
+                'id' => $court->id, 'name' => $court->name, 'venue_id' => $court->venue_id, 'venue_name' => $venues->firstWhere('id', $court->venue_id)?->name,
                 'match' => $current,
                 'tier' => $tier ? ['name' => $tier->name, 'tournament_id' => $tier->tournament_id] : null,
                 'next_match' => $next,
@@ -96,11 +99,11 @@ class PadelController extends Controller
             ];
         });
 
-        $tournaments = Tournament::orderByDesc('id')->get();
+        $tournaments = Tournament::when($venueId, fn ($query) => $query->where('venue_id', $venueId))->orderByDesc('id')->get();
         $standings = [];
         $knockouts = [];
         if ($courts->count() <= 7) {
-            foreach (Tier::whereIn('format', ['group', 'knockout'])->orderBy('id')->get() as $tier) {
+            foreach (Tier::whereIn('format', ['group', 'knockout'])->when($venueId, fn ($query) => $query->whereIn('tournament_id', $tournaments->pluck('id')))->orderBy('id')->get() as $tier) {
                 if ($tier->knockout['confirmed_at'] ?? null) {
                     $broadcast = $progression->broadcast($tier, $courts->pluck('name', 'id')->all());
                     $broadcast['tournament_name'] = $tournaments->firstWhere('id', $tier->tournament_id)?->name;
@@ -118,7 +121,7 @@ class PadelController extends Controller
             }
         }
 
-        return response()->json(['courts' => $courts, 'tournaments' => $tournaments, 'standings' => $standings, 'knockouts' => $knockouts, 'server_time' => now()->toIso8601String()]);
+        return response()->json(['venues' => $venues, 'courts' => $courts, 'tournaments' => $tournaments, 'standings' => $standings, 'knockouts' => $knockouts, 'server_time' => now()->toIso8601String()]);
     }
 
     private function admin(Request $request): void
@@ -156,10 +159,23 @@ class PadelController extends Controller
         return response()->json(['message' => 'Preset berhasil dihapus.']);
     }
 
+    public function createVenue(Request $request): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['name' => 'required|string|max:150']);
+        $name = preg_replace('/\s+/u', ' ', trim($data['name']));
+        if ($name === '' || Venue::whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
+            throw ValidationException::withMessages(['name' => 'Nama venue wajib diisi dan belum digunakan.']);
+        }
+
+        return response()->json(Venue::create(['name' => $name]), 201);
+    }
+
     public function tournament(Request $request): JsonResponse
     {
         $this->admin($request);
-        $data = $request->validate(['name' => 'required|string|max:100', 'venue' => 'nullable|string|max:150', 'date' => 'nullable|date']);
+        $data = $request->validate(['name' => 'required|string|max:100', 'venue_id' => 'required|integer|exists:venues,id', 'date' => 'nullable|date']);
+        $data['venue'] = Venue::findOrFail($data['venue_id'])->name;
 
         return response()->json(Tournament::create($data), 201);
     }
@@ -275,13 +291,13 @@ class PadelController extends Controller
     public function createCourt(Request $request): JsonResponse
     {
         $this->admin($request);
-        $data = $request->validate(['name' => 'required|string|max:100']);
+        $data = $request->validate(['name' => 'required|string|max:100', 'venue_id' => 'required|integer|exists:venues,id']);
         $name = preg_replace('/\s+/u', ' ', trim($data['name']));
-        if ($name === '' || Court::whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
+        if ($name === '' || Court::where('venue_id', $data['venue_id'])->whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
             throw ValidationException::withMessages(['name' => 'Nama court wajib diisi dan belum digunakan.']);
         }
 
-        return response()->json(Court::create(['name' => $name]), 201);
+        return response()->json(Court::create(['name' => $name, 'venue_id' => $data['venue_id']]), 201);
     }
 
     public function deleteCourt(Request $request, Court $court): JsonResponse
@@ -301,10 +317,19 @@ class PadelController extends Controller
     public function court(Request $request, Court $court): JsonResponse
     {
         $this->admin($request);
-        $data = $request->validate(['referee_id' => ['nullable', Rule::exists('users', 'id')->where('role', 'referee'), Rule::unique('courts')->ignore($court->id)]]);
-        $court->update($data);
+        $data = $request->validate(['name' => 'sometimes|required|string|max:100', 'venue_id' => 'sometimes|required|integer|exists:venues,id', 'referee_id' => ['sometimes', 'nullable', Rule::exists('users', 'id')->where('role', 'referee'), Rule::unique('courts')->ignore($court->id)]]);
+        DB::transaction(function () use ($court, $data): void {
+            $locked = Court::whereKey($court->id)->lockForUpdate()->firstOrFail();
+            $venueId = isset($data['venue_id']) ? (int) $data['venue_id'] : $locked->venue_id;
+            abort_if($venueId !== $locked->venue_id && PadelMatch::where('court_id', $locked->id)->where('status', '!=', 'finished')->exists(), 409, 'Pindahkan atau selesaikan seluruh pertandingan sebelum memindahkan court ke venue lain.');
+            $name = preg_replace('/\s+/u', ' ', trim($data['name'] ?? $locked->name));
+            if ($name === '' || Court::where('venue_id', $venueId)->where('id', '!=', $locked->id)->whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
+                throw ValidationException::withMessages(['name' => 'Nama court sudah digunakan di venue ini.']);
+            }
+            $locked->update([...$data, 'name' => $name]);
+        }, 3);
 
-        return response()->json($court);
+        return response()->json($court->fresh());
     }
 
     public function assign(Request $request, PadelMatch $match): JsonResponse
@@ -323,6 +348,8 @@ class PadelController extends Controller
 
                 return;
             }
+            $tournament = Tournament::findOrFail(Tier::findOrFail($locked->tier_id)->tournament_id);
+            abort_unless($court->venue_id === $tournament->venue_id, 422, 'Pilih court yang berada di venue turnamen ini.');
             if ($locked->court_id === $court->id) {
                 return;
             }

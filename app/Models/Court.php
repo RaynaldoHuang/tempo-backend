@@ -10,6 +10,6 @@ class Court extends Model
 
     protected function casts(): array
     {
-        return [];
+        return ['venue_id' => 'integer'];
     }
 }
