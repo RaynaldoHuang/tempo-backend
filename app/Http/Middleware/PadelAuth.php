@@ -1,0 +1,21 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use App\Models\User;
+use Closure;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
+
+class PadelAuth
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        $token = $request->bearerToken();
+        $user = $token ? User::where('api_token', hash('sha256', $token))->where('token_expires_at', '>', now())->first() : null;
+        abort_unless($user, 401, 'Silakan login kembali.');
+        $request->setUserResolver(fn () => $user);
+
+        return $next($request);
+    }
+}
