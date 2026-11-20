@@ -19,6 +19,8 @@ Route::prefix('v1')->middleware(PadelAuth::class)->group(function (): void {
     Route::post('/tiers/{tier}/knockout', [PadelController::class, 'confirmKnockout']);
     Route::post('/tiers', [PadelController::class, 'tier']);
     Route::post('/referees', [PadelController::class, 'referee']);
+    Route::post('/courts', [PadelController::class, 'createCourt']);
+    Route::delete('/courts/{court}', [PadelController::class, 'deleteCourt']);
     Route::patch('/courts/{court}', [PadelController::class, 'court']);
     Route::post('/matches/{match}/assign', [PadelController::class, 'assign']);
     Route::post('/matches/{match}/reorder', [PadelController::class, 'reorder']);

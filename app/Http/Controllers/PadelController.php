@@ -272,6 +272,32 @@ class PadelController extends Controller
         return response()->json(User::create($data), 201);
     }
 
+    public function createCourt(Request $request): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['name' => 'required|string|max:100']);
+        $name = preg_replace('/\s+/u', ' ', trim($data['name']));
+        if ($name === '' || Court::whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
+            throw ValidationException::withMessages(['name' => 'Nama court wajib diisi dan belum digunakan.']);
+        }
+
+        return response()->json(Court::create(['name' => $name]), 201);
+    }
+
+    public function deleteCourt(Request $request, Court $court): JsonResponse
+    {
+        $this->admin($request);
+        DB::transaction(function () use ($court): void {
+            $locked = Court::whereKey($court->id)->lockForUpdate()->firstOrFail();
+            $matches = PadelMatch::where('court_id', $locked->id)->lockForUpdate()->get();
+            abort_if($matches->contains(fn (PadelMatch $match): bool => $match->status !== 'finished'), 409, 'Court masih memiliki pertandingan yang belum selesai. Selesaikan pertandingan atau pindahkan antreannya terlebih dahulu.');
+            PadelMatch::where('court_id', $locked->id)->update(['court_id' => null, 'queue_position' => null, 'version' => DB::raw('version + 1')]);
+            $locked->delete();
+        }, 3);
+
+        return response()->json(['message' => 'Court berhasil dihapus.']);
+    }
+
     public function court(Request $request, Court $court): JsonResponse
     {
         $this->admin($request);

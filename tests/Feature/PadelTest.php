@@ -321,6 +321,71 @@ class PadelTest extends TestCase
         $this->assertDatabaseHas('scoring_presets', ['id' => $preset->id]);
     }
 
+    public function test_admin_can_add_court_and_names_are_validated(): void
+    {
+        $this->account();
+        $response = $this->postJson('/api/v1/courts', ['name' => '  Court   Utama  '])->assertCreated()->assertJsonPath('name', 'Court Utama');
+        $id = $response->json('id');
+        $this->getJson('/api/v1/board')->assertJsonPath('courts.0.id', $id);
+        $this->getJson('/api/v1/data')->assertJsonPath('courts.0.name', 'Court Utama');
+        foreach (['Court Utama', 'court utama', '   ', str_repeat('a', 101)] as $name) {
+            $this->postJson('/api/v1/courts', ['name' => $name])->assertUnprocessable();
+        }
+        $this->assertDatabaseCount('courts', 1);
+    }
+
+    public function test_admin_can_delete_empty_court_and_release_referee_assignment(): void
+    {
+        $referee = User::factory()->create(['role' => 'referee']);
+        $court = Court::create(['name' => 'Empty', 'referee_id' => $referee->id]);
+        $this->account();
+        $this->deleteJson("/api/v1/courts/{$court->id}")->assertOk();
+        $this->assertDatabaseMissing('courts', ['id' => $court->id]);
+        $this->assertDatabaseHas('users', ['id' => $referee->id]);
+        $replacement = Court::create(['name' => 'Replacement', 'referee_id' => $referee->id]);
+        $this->getJson('/api/v1/board')->assertJsonCount(1, 'courts')->assertJsonPath('courts.0.id', $replacement->id);
+        $this->deleteJson("/api/v1/courts/{$court->id}")->assertNotFound();
+    }
+
+    public function test_court_with_unfinished_matches_cannot_be_deleted(): void
+    {
+        $this->account();
+        $match = $this->fixture();
+        foreach (['scheduled', 'live', 'paused', 'review'] as $status) {
+            $match->update(['status' => $status]);
+            $this->deleteJson("/api/v1/courts/{$match->court_id}")->assertConflict();
+            $this->assertDatabaseHas('courts', ['id' => $match->court_id]);
+            $this->assertSame($match->court_id, $match->fresh()->court_id);
+        }
+    }
+
+    public function test_deleting_court_preserves_finished_match_results(): void
+    {
+        $this->account();
+        $match = $this->fixture();
+        $state = $this->points((new ScoringEngine)->initial(), 0, 48);
+        $match->update(['state' => $state, 'status' => 'finished', 'finished_at' => now()]);
+        $this->deleteJson("/api/v1/courts/{$match->court_id}")->assertOk();
+        $this->assertDatabaseCount('padel_matches', 1);
+        $this->assertSame($state, $match->fresh()->state);
+        $this->assertSame('finished', $match->fresh()->status);
+        $this->assertNull($match->fresh()->court_id);
+        $this->assertNull($match->fresh()->queue_position);
+        $this->assertSame(1, $match->fresh()->version);
+        $this->getJson('/api/v1/board')->assertJsonCount(0, 'courts');
+    }
+
+    public function test_only_admin_can_create_and_delete_courts(): void
+    {
+        $court = Court::create(['name' => 'Protected']);
+        $this->postJson('/api/v1/courts', ['name' => 'New'])->assertUnauthorized();
+        $this->deleteJson("/api/v1/courts/{$court->id}")->assertUnauthorized();
+        $this->account('referee');
+        $this->postJson('/api/v1/courts', ['name' => 'New'])->assertForbidden();
+        $this->deleteJson("/api/v1/courts/{$court->id}")->assertForbidden();
+        $this->assertDatabaseCount('courts', 1);
+    }
+
     private function upcoming(PadelMatch $current, string $name): PadelMatch
     {
         return PadelMatch::create(['tier_id' => $current->tier_id, 'group_name' => 'A', 'team_a' => "{$name} A", 'team_b' => "{$name} B", 'state' => (new ScoringEngine)->initial(), 'rules' => ScoringEngine::defaults()]);
