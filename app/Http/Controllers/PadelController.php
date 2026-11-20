@@ -3,12 +3,14 @@
 namespace App\Http\Controllers;
 
 use App\Models\Court;
+use App\Models\CourtReservation;
 use App\Models\PadelMatch;
 use App\Models\ScoringPreset;
 use App\Models\Tier;
 use App\Models\Tournament;
 use App\Models\User;
 use App\Models\Venue;
+use App\Services\CourtQueue;
 use App\Services\ScoringEngine;
 use App\Services\TournamentProgression;
 use Illuminate\Http\JsonResponse;
@@ -70,7 +72,7 @@ class PadelController extends Controller
             'venues' => Venue::orderBy('name')->get(), 'user' => $request->user(), 'courts' => $courts, 'matches' => $matches,
             'tournaments' => Tournament::orderByDesc('id')->get(), 'tiers' => Tier::all()->map(fn (Tier $tier): Tier => $tier->setAttribute('edit_revision', $this->tierRevision($tier))),
             'presets' => ScoringPreset::all(),
-            'knockout_schedule' => $admin ? Tier::whereIn('format', ['group', 'knockout'])->get()->flatMap(fn (Tier $tier): array => $progression->scheduledFixtures($tier))->values() : [],
+            'knockout_schedule' => Tier::whereIn('format', ['group', 'knockout'])->get()->flatMap(fn (Tier $tier): array => $progression->scheduledFixtures($tier))->filter(fn (array $fixture): bool => $admin || $assigned->contains($fixture['court_id']))->values(),
             'referees' => $admin ? User::where('role', 'referee')->get(['id', 'name', 'email']) : [],
             'server_time' => now()->toIso8601String(),
         ]);
@@ -84,9 +86,9 @@ class PadelController extends Controller
         if ($venueId === null) {
             return response()->json(['active_venue_id' => null, 'venues' => [], 'courts' => [], 'tournaments' => [], 'standings' => [], 'knockouts' => [], 'server_time' => now()->toIso8601String()]);
         }
-        $courts = Court::when($venueId, fn ($query) => $query->where('venue_id', $venueId))->orderBy('id')->get()->map(function (Court $court) use ($venues): array {
+        $courts = Court::when($venueId, fn ($query) => $query->where('venue_id', $venueId))->orderBy('id')->get()->map(function (Court $court) use ($venues, $progression): array {
             $matches = PadelMatch::where('court_id', $court->id)->whereIn('tier_id', Tier::whereIn('tournament_id', Tournament::where('venue_id', $court->venue_id)->select('id'))->select('id'))->queueOrder()->get();
-            $pending = $matches->where('status', 'scheduled')->values();
+            $pending = (new CourtQueue)->pending($court->id)->map(fn ($entry): ?PadelMatch => $entry instanceof CourtReservation ? $progression->reservationMatch($entry) : $entry)->filter()->values();
             $current = $matches->first(fn (PadelMatch $match): bool => in_array($match->status, ['live', 'paused', 'review']))
                 ?? $pending->first()
                 ?? $matches->where('status', 'finished')->sortByDesc('finished_at')->first();
@@ -291,6 +293,7 @@ class PadelController extends Controller
             }
             $locked->save();
             if ($structuralChange) {
+                CourtReservation::where('tier_id', $locked->id)->delete();
                 PadelMatch::where('tier_id', $locked->id)->delete();
                 $this->createTierMatches($locked, $engine);
             } elseif ($rulesChanged) {
@@ -330,6 +333,9 @@ class PadelController extends Controller
                 $group = collect($locked->groups)->firstWhere('name', $name);
                 abort_unless($group && count($order) === count($group['teams']) && count(array_unique($order)) === count($order) && ! array_diff($order, $group['teams']), 422, 'Urutan penentu harus memuat seluruh pasangan grup tepat satu kali.');
             }
+            if (($locked->knockout['qualifiers'] ?? 2) !== (int) $data['qualifiers']) {
+                CourtReservation::where('tier_id', $locked->id)->delete();
+            }
             $schedule = ($locked->knockout['qualifiers'] ?? 2) === (int) $data['qualifiers'] ? ($locked->knockout['schedule'] ?? []) : [];
             $locked->update(['knockout' => ['qualifiers' => $data['qualifiers'], 'tie_orders' => $orders, 'schedule' => $schedule]]);
         });
@@ -350,6 +356,14 @@ class PadelController extends Controller
             if ($data['court_id']) {
                 $court = Court::whereKey($data['court_id'])->lockForUpdate()->firstOrFail();
                 abort_unless($court->venue_id === Tournament::findOrFail($locked->tournament_id)->venue_id, 422, 'Pilih court yang berada di venue turnamen ini.');
+            }
+            $reservation = CourtReservation::where('tier_id', $locked->id)->where('round', $data['round'])->where('position', $data['position'])->first();
+            if ($data['court_id']) {
+                if (! $reservation || $reservation->court_id !== (int) $data['court_id']) {
+                    CourtReservation::updateOrCreate(['tier_id' => $locked->id, 'round' => $data['round'], 'position' => $data['position']], ['court_id' => (int) $data['court_id'], 'queue_position' => (new CourtQueue)->nextPosition((int) $data['court_id']), 'version' => ($reservation?->version ?? -1) + 1]);
+                }
+            } else {
+                $reservation?->delete();
             }
             $config = $locked->knockout ?? [];
             $config['schedule'][$data['round'].':'.$data['position']] = $data['court_id'] ? (int) $data['court_id'] : null;
@@ -435,7 +449,7 @@ class PadelController extends Controller
         DB::transaction(function () use ($court, $data): void {
             $locked = Court::whereKey($court->id)->lockForUpdate()->firstOrFail();
             $venueId = isset($data['venue_id']) ? (int) $data['venue_id'] : $locked->venue_id;
-            abort_if($venueId !== $locked->venue_id && PadelMatch::where('court_id', $locked->id)->where('status', '!=', 'finished')->exists(), 409, 'Pindahkan atau selesaikan seluruh pertandingan sebelum memindahkan court ke venue lain.');
+            abort_if($venueId !== $locked->venue_id && (PadelMatch::where('court_id', $locked->id)->where('status', '!=', 'finished')->exists() || CourtReservation::where('court_id', $locked->id)->exists()), 409, 'Pindahkan atau selesaikan seluruh pertandingan sebelum memindahkan court ke venue lain.');
             $name = preg_replace('/\s+/u', ' ', trim($data['name'] ?? $locked->name));
             if ($name === '' || Court::where('venue_id', $venueId)->where('id', '!=', $locked->id)->whereRaw('LOWER(name) = ?', [mb_strtolower($name)])->exists()) {
                 throw ValidationException::withMessages(['name' => 'Nama court sudah digunakan di venue ini.']);
@@ -468,7 +482,7 @@ class PadelController extends Controller
                 return;
             }
             $locked->court_id = $court->id;
-            $locked->queue_position = (PadelMatch::where('court_id', $court->id)->max('queue_position') ?? 0) + 1;
+            $locked->queue_position = (new CourtQueue)->nextPosition($court->id);
             $locked->version++;
             $locked->save();
         }, 3);
@@ -485,21 +499,24 @@ class PadelController extends Controller
             abort_unless($locked->status === 'scheduled' && $locked->court_id, 409, 'Hanya antrean yang dapat diurutkan.');
             Court::whereKey($locked->court_id)->lockForUpdate()->firstOrFail();
             abort_unless($locked->version === $data['version'], 409, 'Antrean berubah. Periksa urutan terbaru.');
-            $queue = PadelMatch::where('court_id', $locked->court_id)->where('status', 'scheduled')->queueOrder()->lockForUpdate()->get();
-            $index = $queue->search(fn (PadelMatch $item): bool => $item->id === $locked->id);
-            $target = $index + ($data['direction'] === 'up' ? -1 : 1);
-            abort_unless($target >= 0 && $target < $queue->count(), 409, 'Pertandingan sudah berada di batas antrean.');
-            $other = $queue[$target];
-            $position = $locked->queue_position;
-            $locked->queue_position = $other->queue_position;
-            $other->queue_position = $position;
-            $locked->version++;
-            $other->version++;
-            $locked->save();
-            $other->save();
+            (new CourtQueue)->move($locked, $data['direction']);
         }, 3);
 
         return response()->json($match->fresh());
+    }
+
+    public function reorderReservation(Request $request, CourtReservation $reservation): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['direction' => 'required|in:up,down', 'version' => 'required|integer|min:0']);
+        DB::transaction(function () use ($reservation, $data): void {
+            Court::whereKey($reservation->court_id)->lockForUpdate()->firstOrFail();
+            $locked = CourtReservation::whereKey($reservation->id)->lockForUpdate()->firstOrFail();
+            abort_unless($locked->version === $data['version'], 409, 'Antrean berubah. Periksa urutan terbaru.');
+            (new CourtQueue)->move($locked, $data['direction']);
+        }, 3);
+
+        return response()->json($reservation->fresh());
     }
 
     public function history(Request $request, PadelMatch $match): JsonResponse
@@ -539,8 +556,8 @@ class PadelController extends Controller
                 abort_unless($locked->status === 'scheduled' && $locked->court_id, 409, 'Pertandingan belum siap dimulai.');
                 Court::whereKey($locked->court_id)->lockForUpdate()->firstOrFail();
                 abort_if(PadelMatch::where('court_id', $locked->court_id)->whereIn('status', ['live', 'paused', 'review'])->exists(), 409, 'Court masih menjalankan pertandingan sebelumnya.');
-                $head = PadelMatch::where('court_id', $locked->court_id)->where('status', 'scheduled')->queueOrder()->first();
-                abort_unless($head?->id === $locked->id, 409, 'Mulai pertandingan sesuai urutan antrean.');
+                $head = (new CourtQueue)->pending($locked->court_id)->first();
+                abort_unless($head instanceof PadelMatch && $head->id === $locked->id, 409, 'Mulai pertandingan sesuai urutan antrean.');
                 abort_if(PadelMatch::where('tier_id', $locked->tier_id)->where('id', '!=', $locked->id)->whereIn('status', ['live', 'paused', 'review'])->where(function ($query) use ($locked): void {
                     $query->whereIn('team_a', [$locked->team_a, $locked->team_b])->orWhereIn('team_b', [$locked->team_a, $locked->team_b]);
                 })->exists(), 409, 'Pasangan masih bermain di court lain.');

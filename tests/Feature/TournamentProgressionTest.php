@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\Court;
+use App\Models\CourtReservation;
 use App\Models\PadelMatch;
 use App\Models\Tier;
 use App\Models\Tournament;
@@ -56,6 +57,84 @@ class TournamentProgressionTest extends TestCase
         $state['sets'] = [['games' => $winner === 0 ? [6, 0] : [0, 6], 'kind' => 'regular', 'winner' => $winner]];
         $match->update(['status' => 'review', 'state' => $state]);
         $this->postJson("/api/v1/matches/{$match->id}/score", ['action' => 'confirm', 'version' => $match->version, 'command_id' => (string) Str::uuid()])->assertOk();
+    }
+
+    public function test_reserved_knockout_slot_joins_queue_immediately_and_reorders_with_group_matches(): void
+    {
+        $this->account();
+        $tier = $this->tier(2, false);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $groups = PadelMatch::where('tier_id', $tier->id)->get();
+        $this->postJson("/api/v1/matches/{$groups[0]->id}/assign", ['court_id' => $court->id])->assertOk()->assertJsonPath('queue_position', 1);
+        $payload = ['round' => 0, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $court->id];
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout-schedule", $payload)->assertOk();
+        $reservation = CourtReservation::firstOrFail();
+        $this->assertSame(2, $reservation->queue_position);
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout-schedule", $payload)->assertOk();
+        $this->assertSame(2, $reservation->fresh()->queue_position);
+        $this->postJson("/api/v1/matches/{$groups[1]->id}/assign", ['court_id' => $court->id])->assertOk()->assertJsonPath('queue_position', 3);
+        $this->postJson("/api/v1/court-reservations/{$reservation->id}/reorder", ['direction' => 'down', 'version' => 0])->assertOk()->assertJsonPath('queue_position', 3);
+        $this->assertSame(2, $groups[1]->fresh()->queue_position);
+        $this->postJson("/api/v1/court-reservations/{$reservation->id}/reorder", ['direction' => 'up', 'version' => 0])->assertConflict();
+        $this->postJson("/api/v1/matches/{$groups[1]->id}/reorder", ['direction' => 'down', 'version' => $groups[1]->fresh()->version])->assertOk()->assertJsonPath('queue_position', 3);
+        PadelMatch::where('tier_id', $tier->id)->update(['status' => 'finished']);
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $match = PadelMatch::where('stage', 'knockout')->orderBy('id')->first();
+        $this->assertSame(2, $match->queue_position);
+        $this->assertSame($court->id, $match->court_id);
+        $this->assertDatabaseCount('court_reservations', 0);
+    }
+
+    public function test_reserved_queue_head_is_visible_on_tv_and_blocks_start_until_reordered(): void
+    {
+        $this->account();
+        $tier = $this->tier(2, false);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout-schedule", ['round' => 0, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $court->id])->assertOk();
+        $reservation = CourtReservation::firstOrFail();
+        $match = PadelMatch::where('tier_id', $tier->id)->first();
+        $this->postJson("/api/v1/matches/{$match->id}/assign", ['court_id' => $court->id])->assertOk()->assertJsonPath('queue_position', 2);
+        $this->getJson('/api/v1/board')->assertOk()->assertJsonPath('courts.0.match.status', 'waiting')->assertJsonPath('courts.0.match.team_a', 'Juara Grup A')->assertJsonPath('courts.0.next_match.id', $match->id);
+        $start = fn (): array => ['action' => 'start', 'server' => 0, 'version' => $match->fresh()->version, 'command_id' => (string) Str::uuid()];
+        $this->postJson("/api/v1/matches/{$match->id}/score", $start())->assertConflict();
+        $this->postJson("/api/v1/matches/{$match->id}/reorder", ['direction' => 'up', 'version' => $match->fresh()->version])->assertOk();
+        $this->postJson("/api/v1/matches/{$match->id}/score", $start())->assertOk();
+        $this->getJson('/api/v1/board')->assertOk()->assertJsonPath('courts.0.match.id', $match->id)->assertJsonPath('courts.0.next_match.reservation_id', $reservation->id);
+        $this->account('referee');
+        $court->update(['referee_id' => User::where('role', 'referee')->latest('id')->first()->id]);
+        $this->getJson('/api/v1/data')->assertOk()->assertJsonCount(1, 'knockout_schedule')->assertJsonPath('knockout_schedule.0.reservation_id', $reservation->id);
+        $this->postJson("/api/v1/court-reservations/{$reservation->id}/reorder", ['direction' => 'up', 'version' => $reservation->fresh()->version])->assertForbidden();
+    }
+
+    public function test_moving_or_removing_reserved_court_updates_queue_without_duplicate_slots(): void
+    {
+        $this->account();
+        $tier = $this->tier(2, false);
+        $venueId = Tournament::find($tier->tournament_id)->venue_id;
+        $first = Court::create(['name' => 'Court 1', 'venue_id' => $venueId]);
+        $second = Court::create(['name' => 'Court 2', 'venue_id' => $venueId]);
+        $url = "/api/v1/tiers/{$tier->id}/knockout-schedule";
+        $payload = ['round' => 0, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $first->id];
+        $this->postJson($url, $payload)->assertOk();
+        $this->postJson($url, [...$payload, 'court_id' => $second->id])->assertOk();
+        $this->assertDatabaseCount('court_reservations', 1);
+        $this->assertDatabaseHas('court_reservations', ['court_id' => $second->id, 'queue_position' => 1]);
+        $this->postJson($url, [...$payload, 'court_id' => null])->assertOk();
+        $this->assertDatabaseCount('court_reservations', 0);
+        $this->getJson('/api/v1/data')->assertJsonPath('knockout_schedule.0.court_id', null)->assertJsonPath('knockout_schedule.0.queue_position', null);
+    }
+
+    public function test_existing_court_choices_are_backfilled_into_queue_by_migration(): void
+    {
+        $tier = $this->tier(2, false);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $tier->update(['knockout' => ['schedule' => ['0:0' => $court->id, '1:0' => $court->id]]]);
+        $migration = require database_path('migrations/2026_11_21_040738_create_court_reservations_table.php');
+        $migration->down();
+        $migration->up();
+        $this->assertDatabaseCount('court_reservations', 2);
+        $this->assertSame([1, 2], CourtReservation::orderBy('queue_position')->pluck('queue_position')->all());
+        $this->assertSame($court->id, $tier->fresh()->knockout['schedule']['0:0']);
     }
 
     public function test_future_knockout_courts_are_saved_before_groups_finish_and_carried_into_each_round(): void

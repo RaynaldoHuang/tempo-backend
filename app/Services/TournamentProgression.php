@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Court;
+use App\Models\CourtReservation;
 use App\Models\PadelMatch;
 use App\Models\Tier;
 use App\Models\Tournament;
@@ -20,12 +21,14 @@ class TournamentProgression
         $fixtures = [];
         $venueId = Tournament::findOrFail($tier->tournament_id)->venue_id;
         $courtIds = Court::where('venue_id', $venueId)->pluck('id')->all();
+        $reservations = CourtReservation::where('tier_id', $tier->id)->get()->keyBy(fn (CourtReservation $entry): string => $entry->round.':'.$entry->position);
         foreach ($overview['rounds'] as $r => $round) {
             foreach ($round['matches'] as $i => $node) {
                 if ($node['match_id']) {
                     continue;
                 }
                 $courtId = $tier->knockout['schedule']["{$r}:{$i}"] ?? null;
+                $reservation = $reservations->get("{$r}:{$i}");
                 $fixtures[] = [
                     'tier_id' => $tier->id, 'round' => $r, 'position' => $i,
                     'round_name' => $round['name'], 'number' => $i + 1, 'bye' => $node['bye'],
@@ -35,11 +38,23 @@ class TournamentProgression
                     'label_b' => $r === 0 ? $node['b']['label'] : 'Pemenang '.$overview['rounds'][$r - 1]['name'].' '.($i * 2 + 2),
                     'court_id' => in_array($courtId, $courtIds, true) ? $courtId : null,
                     'revision' => $this->scheduleRevision($tier),
+                    'reservation_id' => $reservation?->id, 'queue_position' => $reservation?->queue_position, 'version' => $reservation?->version ?? 0,
                 ];
             }
         }
 
         return $fixtures;
+    }
+
+    public function reservationMatch(CourtReservation $reservation): ?PadelMatch
+    {
+        $tier = Tier::findOrFail($reservation->tier_id);
+        $fixture = collect($this->scheduledFixtures($tier))->firstWhere('reservation_id', $reservation->id);
+        if (! $fixture || $fixture['bye']) {
+            return null;
+        }
+
+        return new PadelMatch(['id' => -$reservation->id, 'reservation_id' => $reservation->id, 'tier_id' => $tier->id, 'court_id' => $reservation->court_id, 'queue_position' => $reservation->queue_position, 'group_name' => $fixture['round_name'].' · '.$fixture['number'], 'team_a' => $fixture['team_a'] ?? $fixture['label_a'], 'team_b' => $fixture['team_b'] ?? $fixture['label_b'], 'status' => 'waiting', 'stage' => 'knockout', 'version' => $reservation->version, 'rules' => $tier->rules, 'state' => (new ScoringEngine)->initial()]);
     }
 
     public function overview(Tier $tier): array
@@ -232,17 +247,20 @@ class TournamentProgression
                     continue;
                 }
                 if ($node['a']['team'] === null || $node['b']['team'] === null) {
+                    CourtReservation::where('tier_id', $tier->id)->where('round', $r)->where('position', $i)->delete();
                     $node['bye'] = true;
                     $node['winner'] = $node['a']['team'] ?? $node['b']['team'];
 
                     continue;
                 }
                 if (! $node['match_id']) {
+                    $reservation = CourtReservation::where('tier_id', $tier->id)->where('round', $r)->where('position', $i)->first();
                     $court = Court::whereKey($config['schedule']["{$r}:{$i}"] ?? null)->where('venue_id', Tournament::findOrFail($tier->tournament_id)->venue_id)->lockForUpdate()->first();
                     $match = PadelMatch::create(['tier_id' => $tier->id, 'stage' => 'knockout', 'group_name' => $round['name'].' · '.($i + 1), 'team_a' => $node['a']['team'], 'team_b' => $node['b']['team'], 'rules' => $tier->rules, 'state' => (new ScoringEngine)->initial()]);
                     if ($court) {
-                        $match->update(['court_id' => $court->id, 'queue_position' => (PadelMatch::where('court_id', $court->id)->max('queue_position') ?? 0) + 1]);
+                        $match->update(['court_id' => $court->id, 'queue_position' => $reservation?->queue_position ?? (new CourtQueue)->nextPosition($court->id)]);
                     }
+                    $reservation?->delete();
                     $node['match_id'] = $match->id;
                     $matches->put($match->id, $match);
                 }
