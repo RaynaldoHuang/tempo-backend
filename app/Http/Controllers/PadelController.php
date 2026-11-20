@@ -301,6 +301,20 @@ class PadelController extends Controller
         return response()->json(User::create($data), 201);
     }
 
+    public function updateReferee(Request $request, User $referee): JsonResponse
+    {
+        $this->admin($request);
+        abort_unless($referee->role === 'referee', 404, 'Akun wasit tidak ditemukan.');
+        $data = $request->validate(['name' => 'required|string|max:100']);
+        $name = preg_replace('/\s+/u', ' ', trim($data['name']));
+        if ($name === '') {
+            throw ValidationException::withMessages(['name' => 'Nama wasit wajib diisi.']);
+        }
+        $referee->update(['name' => $name]);
+
+        return response()->json($referee);
+    }
+
     public function createCourt(Request $request): JsonResponse
     {
         $this->admin($request);

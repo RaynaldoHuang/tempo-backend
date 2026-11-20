@@ -387,6 +387,43 @@ class PadelTest extends TestCase
         $this->assertDatabaseCount('courts', 1);
     }
 
+    public function test_admin_can_rename_referee_without_changing_account_or_assignment(): void
+    {
+        $referee = User::factory()->create(['role' => 'referee', 'password' => 'original-password', 'api_token' => hash('sha256', 'original-token'), 'token_expires_at' => now()->addDay()]);
+        $court = Court::create(['name' => 'Court 1', 'referee_id' => $referee->id]);
+        $original = $referee->fresh()->getAttributes();
+        $this->account();
+        $this->patchJson("/api/v1/referees/{$referee->id}", ['name' => '  Budi   Santoso  ', 'email' => 'changed@example.com', 'password' => 'changed-password', 'role' => 'admin'])->assertOk()->assertJsonPath('name', 'Budi Santoso')->assertJsonMissingPath('password')->assertJsonMissingPath('api_token');
+        $updated = $referee->fresh();
+        foreach (['email', 'password', 'api_token', 'token_expires_at', 'role'] as $field) {
+            $this->assertSame($original[$field], $updated->getAttributes()[$field]);
+        }
+        $this->assertSame($referee->id, $court->fresh()->referee_id);
+        $this->getJson('/api/v1/data')->assertJsonPath('referees.0.name', 'Budi Santoso');
+        $this->withToken('original-token')->getJson('/api/v1/data')->assertOk()->assertJsonPath('user.name', 'Budi Santoso');
+    }
+
+    public function test_referee_name_is_validated_and_admin_accounts_cannot_be_renamed_here(): void
+    {
+        $referee = User::factory()->create(['role' => 'referee']);
+        $admin = $this->account();
+        foreach (['', '   ', str_repeat('a', 101)] as $name) {
+            $this->patchJson("/api/v1/referees/{$referee->id}", ['name' => $name])->assertUnprocessable();
+        }
+        $this->patchJson("/api/v1/referees/{$admin->id}", ['name' => 'Not a referee'])->assertNotFound();
+        $this->patchJson('/api/v1/referees/99999', ['name' => 'Missing'])->assertNotFound();
+        $this->assertSame($referee->name, $referee->fresh()->name);
+    }
+
+    public function test_only_admin_can_rename_referees(): void
+    {
+        $referee = User::factory()->create(['role' => 'referee']);
+        $this->patchJson("/api/v1/referees/{$referee->id}", ['name' => 'Blocked'])->assertUnauthorized();
+        $this->account('referee');
+        $this->patchJson("/api/v1/referees/{$referee->id}", ['name' => 'Blocked'])->assertForbidden();
+        $this->assertSame($referee->name, $referee->fresh()->name);
+    }
+
     private function upcoming(PadelMatch $current, string $name): PadelMatch
     {
         return PadelMatch::create(['tier_id' => $current->tier_id, 'group_name' => 'A', 'team_a' => "{$name} A", 'team_b' => "{$name} B", 'state' => (new ScoringEngine)->initial(), 'rules' => ScoringEngine::defaults()]);
