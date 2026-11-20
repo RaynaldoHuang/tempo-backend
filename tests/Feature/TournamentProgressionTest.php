@@ -379,20 +379,20 @@ class TournamentProgressionTest extends TestCase
         $this->assertNull($groupTier->fresh()->knockout);
     }
 
-    public function test_sixteen_team_random_draw_preserves_every_team_and_does_not_redraw_on_refresh(): void
+    public function test_sixty_four_team_random_draw_preserves_every_team_and_does_not_redraw_on_refresh(): void
     {
         $this->account();
-        $tier = $this->directKnockout(16, 'random');
-        $teams = array_map(fn (int $index): string => "Team {$index}", range(1, 16));
+        $tier = $this->directKnockout(64, 'random');
+        $teams = array_map(fn (int $index): string => "Team {$index}", range(1, 64));
         $this->assertEqualsCanonicalizing($teams, $tier->groups[0]['teams']);
         $this->assertSame('random', $tier->knockout['draw_mode']);
         $overview = (new TournamentProgression)->overview($tier);
-        $this->assertSame('Babak 16 besar', $overview['rounds'][0]['name']);
-        $this->assertCount(4, $overview['rounds']);
+        $this->assertSame('Babak 64 besar', $overview['rounds'][0]['name']);
+        $this->assertCount(6, $overview['rounds']);
         $this->getJson("/api/v1/tiers/{$tier->id}/progression")->assertJsonPath('rounds', $overview['rounds'])->assertJsonPath('revision', $overview['revision']);
         $this->postJson("/api/v1/tiers/{$tier->id}/knockout", ['revision' => $overview['revision']])->assertOk();
         $opening = PadelMatch::where('tier_id', $tier->id)->get();
-        $this->assertCount(8, $opening);
+        $this->assertCount(32, $opening);
         $this->assertEqualsCanonicalizing($teams, $opening->flatMap(fn (PadelMatch $match): array => [$match->team_a, $match->team_b])->all());
     }
 
@@ -400,8 +400,9 @@ class TournamentProgressionTest extends TestCase
     {
         $this->account();
         $tournament = Tournament::create(['venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id, 'name' => 'Invalid Draw']);
-        $payload = ['tournament_id' => $tournament->id, 'name' => 'Invalid', 'format' => 'knockout', 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'List', 'teams' => array_map(fn (int $index): string => "Team {$index}", range(1, 17))]]];
-        $this->postJson('/api/v1/tiers', $payload)->assertUnprocessable();
+        $payload = ['tournament_id' => $tournament->id, 'name' => 'Invalid', 'format' => 'knockout', 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'List', 'teams' => array_map(fn (int $index): string => "Team {$index}", range(1, 65))]]];
+        $this->postJson('/api/v1/tiers', $payload)->assertUnprocessable()->assertJsonValidationErrors('groups.0.teams');
+        $this->postJson('/api/v1/tiers', [...$payload, 'format' => 'group', 'groups' => [['name' => 'A', 'teams' => array_map(fn (int $index): string => "Team {$index}", range(1, 17))]]])->assertUnprocessable()->assertJsonValidationErrors('groups.0.teams');
         $payload['groups'] = [['name' => 'A', 'teams' => ['A', 'B']], ['name' => 'B', 'teams' => ['C', 'D']]];
         $this->postJson('/api/v1/tiers', $payload)->assertUnprocessable();
         $tier = $this->directKnockout();
@@ -415,7 +416,7 @@ class TournamentProgressionTest extends TestCase
     public function test_all_direct_knockout_sizes_distribute_byes_and_finish_with_exactly_one_champion(): void
     {
         $this->account();
-        foreach (range(2, 16) as $count) {
+        foreach ([...range(2, 16), 17, 31, 32, 33, 48, 63, 64] as $count) {
             $tier = $this->directKnockout($count);
             $overview = (new TournamentProgression)->overview($tier);
             $size = 2;

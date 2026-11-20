@@ -209,7 +209,7 @@ class PadelController extends Controller
             'tournament_id' => 'required|exists:tournaments,id', 'name' => 'required|string|max:100',
             'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random', 'groups' => 'required|array|min:1|max:16',
             'groups.*.name' => 'required|string|max:50|distinct',
-            'groups.*.teams' => 'required|array|min:2|max:16',
+            'groups.*.teams' => 'required|array|min:2|max:'.($request->input('format') === 'knockout' ? 64 : 16),
             'groups.*.teams.*' => 'required|string|max:100',
         ]);
         $rules = $this->validateRules($request);
@@ -221,7 +221,7 @@ class PadelController extends Controller
             throw ValidationException::withMessages(['groups' => 'Pertandingan langsung membutuhkan tepat dua pasangan per pertandingan.']);
         }
         if ($data['format'] === 'knockout') {
-            abort_unless(count($data['groups']) === 1, 422, 'Knockout langsung membutuhkan satu daftar berisi 2 sampai 16 pasangan.');
+            abort_unless(count($data['groups']) === 1, 422, 'Knockout langsung membutuhkan satu daftar berisi 2 sampai 64 pasangan.');
         }
 
         return [...$data, 'rules' => $rules];
