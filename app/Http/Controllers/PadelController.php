@@ -517,7 +517,7 @@ class PadelController extends Controller
     public function score(Request $request, PadelMatch $match, ScoringEngine $engine): JsonResponse
     {
         $data = $request->validate([
-            'action' => 'required|in:start,point,undo,pause,resume,confirm,reopen',
+            'action' => 'required|in:start,point,undo,pause,resume,confirm,reopen,reset',
             'team' => 'required_if:action,point|integer|in:0,1',
             'server' => 'required_if:action,start|integer|between:0,3',
             'version' => 'required|integer|min:0', 'command_id' => 'required|uuid',
@@ -547,6 +547,14 @@ class PadelController extends Controller
                 $locked->state = $engine->initial($data['server']);
                 $locked->status = 'live';
                 $locked->started_at = now();
+            } elseif ($action === 'reset') {
+                abort_unless(in_array($locked->status, ['live', 'paused', 'review'], true), 409, 'Hanya pertandingan yang sedang berjalan atau belum dikonfirmasi yang dapat dikembalikan ke jadwal.');
+                abort_if($locked->stage === 'group' && ($tier->knockout['confirmed_at'] ?? null), 409, 'Hasil grup sudah menjadi dasar bagan knockout yang dikonfirmasi.');
+                $locked->state = $engine->initial();
+                $locked->status = 'scheduled';
+                $locked->started_at = null;
+                $locked->finished_at = null;
+                DB::table('score_events')->where('padel_match_id', $locked->id)->where('action', 'point')->where('undone', false)->update(['undone' => true, 'updated_at' => now()]);
             } elseif ($action === 'point') {
                 abort_unless($locked->status === 'live', 409, 'Pertandingan tidak sedang berlangsung.');
                 $locked->state = $engine->point($state, $data['team'], $locked->rules);

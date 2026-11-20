@@ -287,6 +287,63 @@ class PadelTest extends TestCase
         $this->assertDatabaseCount('score_events', 3);
     }
 
+    public function test_assigned_referee_can_cancel_and_restart_without_restoring_old_points(): void
+    {
+        $referee = $this->account('referee');
+        $match = $this->fixture();
+        Court::whereKey($match->court_id)->update(['referee_id' => $referee->id]);
+        $rules = $match->rules;
+        $url = "/api/v1/matches/{$match->id}/score";
+        $this->postJson($url, ['action' => 'start', 'server' => 3, 'version' => 0, 'command_id' => (string) Str::uuid()])->assertOk();
+        $this->postJson($url, ['action' => 'point', 'team' => 1, 'version' => 1, 'command_id' => (string) Str::uuid()])->assertOk();
+        $reset = ['action' => 'reset', 'version' => 2, 'command_id' => (string) Str::uuid()];
+        $this->postJson($url, $reset)->assertOk()->assertJsonPath('status', 'scheduled')->assertJsonPath('state', (new ScoringEngine)->initial())->assertJsonPath('started_at', null)->assertJsonPath('finished_at', null)->assertJsonPath('court_id', $match->court_id)->assertJsonPath('queue_position', 1)->assertJsonPath('version', 3);
+        $this->assertSame($rules, $match->fresh()->rules);
+        $this->assertDatabaseHas('score_events', ['padel_match_id' => $match->id, 'action' => 'point', 'undone' => true]);
+        $this->assertDatabaseHas('score_events', ['padel_match_id' => $match->id, 'action' => 'reset', 'before_state' => json_encode([...(new ScoringEngine)->initial(3), 'points' => [0, 1]])]);
+        $this->postJson($url, $reset)->assertOk()->assertJsonPath('version', 3);
+        $this->postJson($url, ['action' => 'point', 'team' => 0, 'version' => 2, 'command_id' => (string) Str::uuid()])->assertConflict();
+        $this->postJson($url, ['action' => 'start', 'server' => 2, 'version' => 3, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('state.points', [0, 0])->assertJsonPath('state.server', 2);
+        $this->postJson($url, ['action' => 'undo', 'version' => 4, 'command_id' => (string) Str::uuid()])->assertConflict();
+        $this->postJson($url, ['action' => 'point', 'team' => 0, 'version' => 4, 'command_id' => (string) Str::uuid()])->assertOk();
+        $this->postJson($url, ['action' => 'undo', 'version' => 5, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('state.points', [0, 0]);
+    }
+
+    public function test_cancel_clears_all_scores_from_paused_or_unconfirmed_match(): void
+    {
+        $this->account();
+        $match = $this->fixture();
+        foreach (['paused', 'review'] as $status) {
+            $state = (new ScoringEngine)->initial();
+            $state['games'] = [4, 5];
+            $state['sets'] = [['games' => [6, 2], 'kind' => 'regular', 'winner' => 0]];
+            $state['points'] = [10, 9];
+            $state['mode'] = 'super';
+            $state['winner'] = $status === 'review' ? 0 : null;
+            $match->update(['status' => $status, 'state' => $state, 'started_at' => now()]);
+            $this->postJson("/api/v1/matches/{$match->id}/score", ['action' => 'reset', 'version' => $match->fresh()->version, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('status', 'scheduled')->assertJsonPath('state', (new ScoringEngine)->initial())->assertJsonPath('started_at', null);
+        }
+    }
+
+    public function test_cancel_rejects_other_referee_finished_match_and_locked_group_results(): void
+    {
+        $match = $this->fixture();
+        $match->update(['status' => 'live']);
+        $url = "/api/v1/matches/{$match->id}/score";
+        $reset = fn (): array => ['action' => 'reset', 'version' => 0, 'command_id' => (string) Str::uuid()];
+        $this->account('referee');
+        $this->postJson($url, $reset())->assertForbidden();
+        $this->account();
+        $match->update(['status' => 'finished']);
+        $this->postJson($url, $reset())->assertConflict();
+        $match->update(['status' => 'scheduled']);
+        $this->postJson($url, $reset())->assertConflict();
+        $match->update(['status' => 'review']);
+        Tier::whereKey($match->tier_id)->update(['knockout' => ['confirmed_at' => now()->toIso8601String()]]);
+        $this->postJson($url, $reset())->assertConflict();
+        $this->assertSame('review', $match->fresh()->status);
+    }
+
     public function test_referee_cannot_score_another_court_or_create_accounts(): void
     {
         $this->account('referee');
