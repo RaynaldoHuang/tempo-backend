@@ -76,15 +76,15 @@ class VenueTest extends TestCase
 
     public function test_public_tv_filters_courts_tournaments_and_slides_by_venue(): void
     {
-        $a = Venue::create(['name' => 'Alpha']);
-        $b = Venue::create(['name' => 'Beta']);
+        $a = Venue::create(['name' => 'Alpha', 'is_active' => true]);
+        $b = Venue::create(['name' => 'Beta', 'is_active' => true]);
         $matchA = $this->matchAt($a);
         $this->matchAt($b);
         foreach (range(1, 7) as $number) {
             Court::create(['name' => "Court {$number}", 'venue_id' => $a->id]);
         }
         Court::create(['name' => 'Court 1', 'venue_id' => $b->id]);
-        $this->getJson('/api/v1/board')->assertJsonCount(8, 'courts')->assertJsonCount(0, 'standings');
+        $this->getJson('/api/v1/board')->assertJsonCount(7, 'courts')->assertJsonCount(1, 'standings');
         $this->getJson("/api/v1/board?venue_id={$a->id}")->assertOk()->assertJsonCount(7, 'courts')->assertJsonCount(1, 'tournaments')->assertJsonCount(1, 'standings')->assertJsonPath('courts.0.venue_name', 'Alpha')->assertJsonPath('standings.0.tier_id', $matchA->tier_id);
         $this->getJson('/api/v1/board?venue_id=99999')->assertUnprocessable();
     }
@@ -97,6 +97,71 @@ class VenueTest extends TestCase
         $this->account('referee');
         $this->postJson('/api/v1/venues', ['name' => 'No'])->assertForbidden();
         $this->patchJson("/api/v1/courts/{$court->id}", ['venue_id' => $venue->id])->assertForbidden();
+    }
+
+    public function test_tv_only_exposes_active_venues_and_cannot_select_inactive_venue(): void
+    {
+        Venue::query()->update(['is_active' => false]);
+        $active = Venue::create(['name' => 'Visible Club', 'is_active' => true]);
+        $hidden = Venue::create(['name' => 'Hidden Club']);
+        $this->matchAt($active);
+        $this->matchAt($hidden);
+        Court::create(['name' => 'Visible Court', 'venue_id' => $active->id]);
+        Court::create(['name' => 'Hidden Court', 'venue_id' => $hidden->id]);
+        $this->getJson('/api/v1/board')->assertOk()->assertJsonCount(1, 'venues')->assertJsonPath('active_venue_id', $active->id)->assertJsonPath('venues.0.name', 'Visible Club')->assertJsonCount(1, 'courts')->assertJsonCount(1, 'tournaments')->assertJsonCount(1, 'standings');
+        $this->getJson("/api/v1/board?venue_id={$hidden->id}")->assertOk()->assertJsonPath('active_venue_id', $active->id)->assertJsonPath('courts.0.name', 'Visible Court');
+        $this->account();
+        $this->patchJson("/api/v1/venues/{$hidden->id}", ['is_active' => true])->assertOk()->assertJsonPath('is_active', true);
+        $this->getJson("/api/v1/board?venue_id={$hidden->id}")->assertJsonCount(2, 'venues')->assertJsonPath('active_venue_id', $hidden->id)->assertJsonPath('courts.0.name', 'Hidden Court');
+        $this->patchJson("/api/v1/venues/{$hidden->id}", ['is_active' => false])->assertOk();
+        $this->patchJson("/api/v1/venues/{$active->id}", ['is_active' => false])->assertOk();
+        $this->getJson('/api/v1/board')->assertJsonPath('active_venue_id', null)->assertJsonCount(0, 'venues')->assertJsonCount(0, 'courts')->assertJsonCount(0, 'tournaments')->assertJsonCount(0, 'standings')->assertJsonCount(0, 'knockouts');
+        $this->assertDatabaseCount('courts', 2);
+        $this->assertDatabaseCount('tournaments', 2);
+    }
+
+    public function test_moved_court_does_not_broadcast_old_results_from_inactive_venue(): void
+    {
+        $this->account();
+        Venue::query()->update(['is_active' => false]);
+        $active = Venue::create(['name' => 'Visible', 'is_active' => true]);
+        $hidden = Venue::create(['name' => 'Hidden']);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => $hidden->id]);
+        $match = $this->matchAt($hidden);
+        $match->update(['court_id' => $court->id, 'status' => 'finished']);
+        $this->patchJson("/api/v1/courts/{$court->id}", ['venue_id' => $active->id])->assertOk();
+        $this->getJson('/api/v1/board')->assertJsonCount(1, 'courts')->assertJsonPath('courts.0.match', null)->assertJsonCount(0, 'tournaments');
+        $this->assertDatabaseHas('padel_matches', ['id' => $match->id, 'status' => 'finished']);
+    }
+
+    public function test_only_admin_can_control_venue_visibility_and_new_venue_starts_inactive(): void
+    {
+        $venue = Venue::firstOrFail();
+        $this->patchJson("/api/v1/venues/{$venue->id}", ['is_active' => false])->assertUnauthorized();
+        $this->account('referee');
+        $this->patchJson("/api/v1/venues/{$venue->id}", ['is_active' => false])->assertForbidden();
+        $this->account();
+        $this->patchJson("/api/v1/venues/{$venue->id}", ['is_active' => 'not-a-boolean'])->assertUnprocessable();
+        $id = $this->postJson('/api/v1/venues', ['name' => 'New Club'])->assertCreated()->json('id');
+        $this->assertFalse(Venue::findOrFail($id)->is_active);
+    }
+
+    public function test_visibility_migration_activates_latest_tournament_venue_without_changing_data(): void
+    {
+        $migration = require database_path('migrations/2026_11_21_015738_add_is_active_to_venues_table.php');
+        $migration->down();
+        $a = Venue::create(['name' => 'Older Club']);
+        $b = Venue::create(['name' => 'Latest Club']);
+        $this->matchAt($a);
+        $match = $this->matchAt($b);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => $b->id]);
+        $match->update(['court_id' => $court->id]);
+        $migration->up();
+        $this->assertFalse($a->fresh()->is_active);
+        $this->assertTrue($b->fresh()->is_active);
+        $this->assertSame(1, Venue::where('is_active', true)->count());
+        $this->assertSame($court->id, $match->fresh()->court_id);
+        $this->assertDatabaseCount('padel_matches', 2);
     }
 
     public function test_venue_migration_rollback_keeps_tournaments_and_match_history(): void

@@ -77,10 +77,14 @@ class PadelController extends Controller
 
     public function board(Request $request, TournamentProgression $progression): JsonResponse
     {
-        $venueId = $request->validate(['venue_id' => 'sometimes|integer|exists:venues,id'])['venue_id'] ?? null;
-        $venues = Venue::orderBy('name')->get();
+        $requestedVenueId = $request->validate(['venue_id' => 'sometimes|integer|exists:venues,id'])['venue_id'] ?? null;
+        $venues = Venue::where('is_active', true)->orderBy('name')->get();
+        $venueId = $venues->firstWhere('id', $requestedVenueId)?->id ?? $venues->first()?->id;
+        if ($venueId === null) {
+            return response()->json(['active_venue_id' => null, 'venues' => [], 'courts' => [], 'tournaments' => [], 'standings' => [], 'knockouts' => [], 'server_time' => now()->toIso8601String()]);
+        }
         $courts = Court::when($venueId, fn ($query) => $query->where('venue_id', $venueId))->orderBy('id')->get()->map(function (Court $court) use ($venues): array {
-            $matches = PadelMatch::where('court_id', $court->id)->queueOrder()->get();
+            $matches = PadelMatch::where('court_id', $court->id)->whereIn('tier_id', Tier::whereIn('tournament_id', Tournament::where('venue_id', $court->venue_id)->select('id'))->select('id'))->queueOrder()->get();
             $pending = $matches->where('status', 'scheduled')->values();
             $current = $matches->first(fn (PadelMatch $match): bool => in_array($match->status, ['live', 'paused', 'review']))
                 ?? $pending->first()
@@ -121,7 +125,7 @@ class PadelController extends Controller
             }
         }
 
-        return response()->json(['venues' => $venues, 'courts' => $courts, 'tournaments' => $tournaments, 'standings' => $standings, 'knockouts' => $knockouts, 'server_time' => now()->toIso8601String()]);
+        return response()->json(['active_venue_id' => $venueId, 'venues' => $venues, 'courts' => $courts, 'tournaments' => $tournaments, 'standings' => $standings, 'knockouts' => $knockouts, 'server_time' => now()->toIso8601String()]);
     }
 
     private function admin(Request $request): void
@@ -169,6 +173,15 @@ class PadelController extends Controller
         }
 
         return response()->json(Venue::create(['name' => $name]), 201);
+    }
+
+    public function updateVenue(Request $request, Venue $venue): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['is_active' => 'required|boolean']);
+        $venue->update($data);
+
+        return response()->json($venue);
     }
 
     public function tournament(Request $request): JsonResponse

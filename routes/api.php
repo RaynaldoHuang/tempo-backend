@@ -13,6 +13,7 @@ Route::prefix('v1')->middleware(PadelAuth::class)->group(function (): void {
     Route::post('/password', [PadelController::class, 'password']);
     Route::post('/presets', [PadelController::class, 'preset']);
     Route::delete('/presets/{preset}', [PadelController::class, 'deletePreset']);
+    Route::patch('/venues/{venue}', [PadelController::class, 'updateVenue']);
     Route::post('/venues', [PadelController::class, 'createVenue']);
     Route::post('/tournaments', [PadelController::class, 'tournament']);
     Route::get('/tiers/{tier}/progression', [PadelController::class, 'progression']);
