@@ -139,6 +139,7 @@ class PadelController extends Controller
             'rules.regular_sets' => ['required', Rule::in([1, 2])],
             'rules.games_to_win' => 'required|integer|min:2|max:9',
             'rules.golden_point' => 'required|boolean',
+            'rules.deuce_rule' => ['sometimes', Rule::in(['advantage', 'golden', 'one_advantage'])],
             'rules.tiebreak_at' => 'sometimes|nullable|integer|min:2|lte:rules.games_to_win',
             'rules.tiebreak_win_by_two' => 'sometimes|boolean',
             'rules.tiebreak_points' => 'required|integer|min:5|max:21',

@@ -43,7 +43,9 @@ class ScoringEngine
 
             return $state;
         }
-        if ($a >= 4 && ($a - $b >= 2 || ($rules['golden_point'] && $b >= 3))) {
+        $deuceRule = $rules['deuce_rule'] ?? ($rules['golden_point'] ? 'golden' : 'advantage');
+        $goldenPoint = $a > $b && (($deuceRule === 'golden' && $b >= 3) || ($deuceRule === 'one_advantage' && $b >= 4));
+        if ($a >= 4 && ($a - $b >= 2 || $goldenPoint)) {
             $state['games'][$team]++;
             $state['points'] = [0, 0];
             $state['server'] = ($state['game_server'] + 1) % 4;

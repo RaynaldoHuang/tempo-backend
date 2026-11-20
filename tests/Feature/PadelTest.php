@@ -82,6 +82,73 @@ class PadelTest extends TestCase
         $this->assertSame([1, 0], $golden['games']);
     }
 
+    public function test_one_advantage_then_golden_point_for_either_team_and_each_new_game(): void
+    {
+        $rules = [...ScoringEngine::defaults(), 'deuce_rule' => 'one_advantage'];
+        foreach ([0, 1] as $leader) {
+            foreach ([0, 1] as $winner) {
+                $state = $this->points((new ScoringEngine)->initial(), 0, 3, $rules);
+                $state = $this->points($state, 1, 3, $rules);
+                $state = $this->points($state, $leader, 1, $rules);
+                $this->assertSame([0, 0], $state['games']);
+                $this->assertSame(4, $state['points'][$leader]);
+                $consecutive = $this->points($state, $leader, 1, $rules);
+                $this->assertSame(1, $consecutive['games'][$leader]);
+                $state = $this->points($state, 1 - $leader, 1, $rules);
+                $this->assertSame([4, 4], $state['points']);
+                $this->assertSame([0, 0], $state['games']);
+                $state = $this->points($state, $winner, 1, $rules);
+                $this->assertSame(1, $state['games'][$winner]);
+                $this->assertSame([0, 0], $state['points']);
+                $state = $this->points($state, 0, 3, $rules);
+                $state = $this->points($state, 1, 3, $rules);
+                $state = $this->points($state, 0, 1, $rules);
+                $this->assertSame(1, array_sum($state['games']));
+                $this->assertSame([4, 3], $state['points']);
+            }
+        }
+    }
+
+    public function test_one_advantage_rule_does_not_change_tiebreak_or_super_tiebreak_margin(): void
+    {
+        $rules = [...ScoringEngine::defaults(), 'deuce_rule' => 'one_advantage'];
+        foreach (['tiebreak' => 6, 'super' => 9] as $mode => $tied) {
+            $state = (new ScoringEngine)->initial();
+            $state['mode'] = $mode;
+            $state['points'] = [$tied, $tied];
+            $state = $this->points($state, 0, 1, $rules);
+            $this->assertNull($state['winner']);
+            $this->assertCount(0, $state['sets']);
+            $state = $this->points($state, 0, 1, $rules);
+            $this->assertCount(1, $state['sets']);
+        }
+    }
+
+    public function test_new_deuce_rule_is_saved_to_presets_and_matches_and_rejects_unknown_rule(): void
+    {
+        $this->account();
+        $rules = [...ScoringEngine::defaults(), 'deuce_rule' => 'one_advantage'];
+        $this->postJson('/api/v1/presets', ['name' => 'One advantage', 'rules' => $rules])->assertCreated()->assertJsonPath('rules.deuce_rule', 'one_advantage');
+        $tournament = Tournament::create(['name' => 'Open', 'venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id]);
+        $this->postJson('/api/v1/tiers', ['name' => 'Bronze', 'tournament_id' => $tournament->id, 'format' => 'direct', 'rules' => $rules, 'groups' => [['name' => 'Final', 'teams' => ['One', 'Two']]]])->assertCreated()->assertJsonPath('rules.deuce_rule', 'one_advantage');
+        $this->assertSame('one_advantage', PadelMatch::first()->rules['deuce_rule']);
+        $this->postJson('/api/v1/presets', ['name' => 'Invalid', 'rules' => [...$rules, 'deuce_rule' => 'unknown']])->assertUnprocessable()->assertJsonValidationErrors('rules.deuce_rule');
+    }
+
+    public function test_undo_golden_point_restores_second_deuce_and_either_team_can_win_next_point(): void
+    {
+        $this->account();
+        $match = $this->fixture();
+        $state = (new ScoringEngine)->initial();
+        $state['points'] = [4, 4];
+        $state['games'] = [1, 0];
+        $match->update(['status' => 'live', 'state' => $state, 'rules' => [...ScoringEngine::defaults(), 'regular_sets' => 1, 'games_to_win' => 2, 'deuce_rule' => 'one_advantage']]);
+        $url = "/api/v1/matches/{$match->id}/score";
+        $this->postJson($url, ['action' => 'point', 'team' => 0, 'version' => 0, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('status', 'review')->assertJsonPath('state.winner', 0);
+        $this->postJson($url, ['action' => 'undo', 'version' => 1, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('status', 'live')->assertJsonPath('state.points', [4, 4])->assertJsonPath('state.games', [1, 0]);
+        $this->postJson($url, ['action' => 'point', 'team' => 1, 'version' => 2, 'command_id' => (string) Str::uuid()])->assertOk()->assertJsonPath('state.games', [1, 1])->assertJsonPath('state.points', [0, 0]);
+    }
+
     public function test_tiebreak_at_six_all_and_service_rotation(): void
     {
         $state = (new ScoringEngine)->initial();
