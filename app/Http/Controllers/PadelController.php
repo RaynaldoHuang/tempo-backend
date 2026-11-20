@@ -207,10 +207,12 @@ class PadelController extends Controller
     {
         $data = $request->validate([
             'tournament_id' => 'required|exists:tournaments,id', 'name' => 'required|string|max:100',
-            'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random', 'groups' => 'required|array|min:1|max:16',
+            'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random,seeded', 'groups' => 'required|array|min:1|max:16',
             'groups.*.name' => 'required|string|max:50|distinct',
             'groups.*.teams' => 'required|array|min:2|max:'.($request->input('format') === 'knockout' ? 64 : 16),
             'groups.*.teams.*' => 'required|string|max:100',
+            'seeds' => 'required_if:draw_mode,seeded|array|list|min:2|max:4',
+            'seeds.*' => 'required|string|max:100|distinct',
         ]);
         $rules = $this->validateRules($request);
         $names = collect($data['groups'])->flatMap(fn (array $group) => $group['teams']);
@@ -222,6 +224,12 @@ class PadelController extends Controller
         }
         if ($data['format'] === 'knockout') {
             abort_unless(count($data['groups']) === 1, 422, 'Knockout langsung membutuhkan satu daftar berisi 2 sampai 64 pasangan.');
+        }
+
+        if (($data['draw_mode'] ?? null) === 'seeded') {
+            if ($data['format'] !== 'knockout' || ! in_array(count($data['seeds']), [2, 4], true) || array_diff($data['seeds'], $data['groups'][0]['teams'])) {
+                throw ValidationException::withMessages(['seeds' => 'Pilih 2 atau 4 pasangan unggulan yang berbeda dari peserta knockout.']);
+            }
         }
 
         return [...$data, 'rules' => $rules];
@@ -247,14 +255,15 @@ class PadelController extends Controller
         $this->admin($request);
         $data = $this->validateTier($request);
         $drawMode = $data['draw_mode'] ?? 'ordered';
-        unset($data['draw_mode']);
+        $seeds = $drawMode === 'seeded' ? $data['seeds'] : [];
+        unset($data['draw_mode'], $data['seeds']);
         if ($data['format'] === 'knockout' && $drawMode === 'random') {
             $data['groups'][0]['teams'] = collect($data['groups'][0]['teams'])->shuffle()->all();
         }
-        $tier = DB::transaction(function () use ($data, $engine, $drawMode): Tier {
+        $tier = DB::transaction(function () use ($data, $engine, $drawMode, $seeds): Tier {
             $tier = Tier::create($data);
             if ($tier->format === 'knockout') {
-                $tier->update(['knockout' => ['draw_mode' => $drawMode]]);
+                $tier->update(['knockout' => ['draw_mode' => $drawMode, ...($drawMode === 'seeded' ? ['seeds' => $seeds, 'draw_slots' => (new TournamentProgression)->seededSlots($tier->groups[0]['teams'], $seeds)] : [])]]);
             }
             $this->createTierMatches($tier, $engine);
 
@@ -268,7 +277,7 @@ class PadelController extends Controller
     {
         $this->admin($request);
         $base = $request->validate(['name' => 'required|string|max:100', 'edit_revision' => 'required|string|size:64']);
-        $fullEdit = $request->hasAny(['tournament_id', 'format', 'rules', 'groups', 'draw_mode']);
+        $fullEdit = $request->hasAny(['tournament_id', 'format', 'rules', 'groups', 'draw_mode', 'seeds']);
         $data = $fullEdit ? $this->validateTier($request) : ['name' => $base['name']];
         DB::transaction(function () use ($tier, $engine, $base, $fullEdit, $data): void {
             $locked = Tier::whereKey($tier->id)->lockForUpdate()->firstOrFail();
@@ -281,15 +290,19 @@ class PadelController extends Controller
             $matches = PadelMatch::where('tier_id', $locked->id)->lockForUpdate()->get();
             abort_if(($locked->knockout['confirmed_at'] ?? null) || $matches->contains(fn (PadelMatch $match): bool => $match->status !== 'scheduled' || $match->started_at !== null) || DB::table('score_events')->whereIn('padel_match_id', $matches->pluck('id'))->exists(), 409, 'Pertandingan sudah dimulai atau bagan sudah dikonfirmasi. Hanya nama tier yang dapat diubah.');
             $drawMode = $data['draw_mode'] ?? ($locked->knockout['draw_mode'] ?? 'ordered');
-            $structuralChange = (int) $data['tournament_id'] !== $locked->tournament_id || $data['format'] !== $locked->format || $data['groups'] != $locked->groups || ($data['format'] === 'knockout' && $drawMode !== ($locked->knockout['draw_mode'] ?? 'ordered'));
+            $seeds = $drawMode === 'seeded' ? ($data['seeds'] ?? $locked->knockout['seeds'] ?? []) : [];
+            if ($data['format'] === 'knockout' && $drawMode === 'seeded' && (! in_array(count($seeds), [2, 4], true) || array_diff($seeds, $data['groups'][0]['teams']))) {
+                throw ValidationException::withMessages(['seeds' => 'Pilih kembali pasangan unggulan dari peserta knockout.']);
+            }
+            $structuralChange = (int) $data['tournament_id'] !== $locked->tournament_id || $data['format'] !== $locked->format || $data['groups'] != $locked->groups || ($data['format'] === 'knockout' && ($drawMode !== ($locked->knockout['draw_mode'] ?? 'ordered') || ($drawMode === 'seeded' && $seeds !== ($locked->knockout['seeds'] ?? []))));
             $rulesChanged = $data['rules'] != $locked->rules;
-            unset($data['draw_mode']);
+            unset($data['draw_mode'], $data['seeds']);
             if ($structuralChange && $data['format'] === 'knockout' && $drawMode === 'random') {
                 $data['groups'][0]['teams'] = collect($data['groups'][0]['teams'])->shuffle()->all();
             }
             $locked->fill($data);
             if ($structuralChange) {
-                $locked->knockout = $data['format'] === 'knockout' ? ['draw_mode' => $drawMode] : null;
+                $locked->knockout = $data['format'] === 'knockout' ? ['draw_mode' => $drawMode, ...($drawMode === 'seeded' ? ['seeds' => $seeds, 'draw_slots' => (new TournamentProgression)->seededSlots($data['groups'][0]['teams'], $seeds)] : [])] : null;
             }
             $locked->save();
             if ($structuralChange) {

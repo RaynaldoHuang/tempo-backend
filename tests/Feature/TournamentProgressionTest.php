@@ -379,6 +379,103 @@ class TournamentProgressionTest extends TestCase
         $this->assertNull($groupTier->fresh()->knockout);
     }
 
+    public function test_seeded_sixteen_draw_locks_exact_reference_positions_and_survives_rule_edits(): void
+    {
+        $this->account();
+        $tournament = Tournament::create(['name' => 'Seeded Open', 'venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id]);
+        $teams = array_map(fn (int $i): string => "Team {$i}", range(1, 16));
+        $seeds = ['Team 5', 'Team 11', 'Team 3', 'Team 7'];
+        $payload = ['name' => 'Seeded', 'tournament_id' => $tournament->id, 'format' => 'knockout', 'draw_mode' => 'seeded', 'seeds' => $seeds, 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'Peserta', 'teams' => $teams]]];
+        $id = $this->postJson('/api/v1/tiers', $payload)->assertCreated()->assertJsonPath('knockout.seeds', $seeds)->json('id');
+        $tier = Tier::findOrFail($id);
+        $slots = $tier->knockout['draw_slots'];
+        foreach ([0, 15, 8, 7] as $rank => $position) {
+            $this->assertSame($seeds[$rank], $slots[$position]['team']);
+            $this->assertSame('TOP '.($rank + 1), $slots[$position]['label']);
+        }
+        $this->assertEqualsCanonicalizing($teams, array_column($slots, 'team'));
+        $preview = (new TournamentProgression)->overview($tier);
+        $this->getJson("/api/v1/tiers/{$id}/progression")->assertJsonPath('rounds', $preview['rounds']);
+        $revision = collect($this->getJson('/api/v1/data')->json('tiers'))->firstWhere('id', $id)['edit_revision'];
+        $rules = [...$tier->rules, 'super_win_by_two' => false];
+        $this->patchJson("/api/v1/tiers/{$id}", [...$payload, 'rules' => $rules, 'edit_revision' => $revision])->assertOk();
+        $this->assertSame($slots, $tier->fresh()->knockout['draw_slots']);
+        $this->postJson("/api/v1/tiers/{$id}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $this->getJson("/api/v1/tiers/{$id}/progression")->assertJsonPath('rounds.0.matches.0.a.team', 'Team 5')->assertJsonPath('rounds.0.matches.7.b.team', 'Team 11');
+        $revision = collect($this->getJson('/api/v1/data')->json('tiers'))->firstWhere('id', $id)['edit_revision'];
+        $this->patchJson("/api/v1/tiers/{$id}", [...$payload, 'seeds' => array_reverse($seeds), 'edit_revision' => $revision])->assertConflict();
+    }
+
+    public function test_changing_seeds_rebuilds_unconfirmed_draw_and_releases_old_court_reservations(): void
+    {
+        $this->account();
+        $tournament = Tournament::create(['name' => 'Seeded Open', 'venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id]);
+        $teams = array_map(fn (int $i): string => "Team {$i}", range(1, 8));
+        $payload = ['name' => 'Seeded', 'tournament_id' => $tournament->id, 'format' => 'knockout', 'draw_mode' => 'seeded', 'seeds' => array_slice($teams, 0, 4), 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'Peserta', 'teams' => $teams]]];
+        $id = $this->postJson('/api/v1/tiers', $payload)->assertCreated()->json('id');
+        $tier = Tier::findOrFail($id);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => $tournament->venue_id]);
+        $reservation = ['round' => 0, 'position' => 0, 'court_id' => $court->id, 'revision' => (new TournamentProgression)->scheduleRevision($tier)];
+        $this->postJson("/api/v1/tiers/{$id}/knockout-schedule", $reservation)->assertOk();
+        $revision = collect($this->getJson('/api/v1/data')->json('tiers'))->firstWhere('id', $id)['edit_revision'];
+        $seeds = ['Team 8', 'Team 7', 'Team 6', 'Team 5'];
+        $this->patchJson("/api/v1/tiers/{$id}", [...$payload, 'seeds' => $seeds, 'edit_revision' => $revision])->assertOk()->assertJsonPath('knockout.seeds', $seeds);
+        $this->assertSame('Team 8', $tier->fresh()->knockout['draw_slots'][0]['team']);
+        $this->assertSame('Team 7', $tier->fresh()->knockout['draw_slots'][7]['team']);
+        $this->assertDatabaseCount('court_reservations', 0);
+        $this->postJson("/api/v1/tiers/{$id}/knockout-schedule", $reservation)->assertConflict();
+    }
+
+    public function test_seeded_draws_support_two_or_four_seeds_and_prioritize_byes_up_to_sixty_four(): void
+    {
+        $this->account();
+        $tournament = Tournament::create(['name' => 'Seeded Open', 'venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id]);
+        foreach ([2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48, 63, 64] as $count) {
+            $teams = array_map(fn (int $i): string => "Team {$i}", range(1, $count));
+            foreach ($count >= 4 ? [2, 4] : [2] as $seedCount) {
+                $seeds = array_slice($teams, 0, $seedCount);
+                $id = $this->postJson('/api/v1/tiers', ['name' => 'Seeded', 'tournament_id' => $tournament->id, 'format' => 'knockout', 'draw_mode' => 'seeded', 'seeds' => $seeds, 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'Peserta', 'teams' => $teams]]])->assertCreated()->json('id');
+                $tier = Tier::findOrFail($id);
+                $slots = $tier->knockout['draw_slots'];
+                $size = count($slots);
+                $this->assertEqualsCanonicalizing($teams, array_values(array_filter(array_column($slots, 'team'))));
+                $this->assertSame($size - $count, count(array_filter($slots, fn (array $slot): bool => $slot['team'] === null)));
+                foreach (array_slice([0, $size - 1, intdiv($size, 2), intdiv($size, 2) - 1], 0, $seedCount) as $rank => $position) {
+                    $this->assertSame($seeds[$rank], $slots[$position]['team']);
+                    if ($rank < $size - $count) {
+                        $this->assertNull($slots[$position ^ 1]['team']);
+                    }
+                }
+                $overview = (new TournamentProgression)->overview($tier);
+                foreach ($overview['rounds'][0]['matches'] as $node) {
+                    $this->assertTrue($node['a']['team'] !== null || $node['b']['team'] !== null);
+                }
+                if ($count === 5 || $count === 64) {
+                    $this->postJson("/api/v1/tiers/{$id}/knockout", ['revision' => $overview['revision']])->assertOk();
+                    while ($match = PadelMatch::where('tier_id', $id)->where('status', 'scheduled')->first()) {
+                        $this->confirm($match);
+                    }
+                    $this->assertSame($count - 1, PadelMatch::where('tier_id', $id)->count());
+                    $rounds = $tier->fresh()->knockout['rounds'];
+                    $this->assertNotNull($rounds[count($rounds) - 1]['matches'][0]['winner']);
+                }
+            }
+        }
+    }
+
+    public function test_seeded_draw_rejects_missing_duplicate_unknown_or_invalid_number_of_seeds(): void
+    {
+        $this->account();
+        $tournament = Tournament::create(['name' => 'Seeded Open', 'venue_id' => Venue::firstOrCreate(['name' => 'Venue Utama'])->id]);
+        $payload = ['name' => 'Seeded', 'tournament_id' => $tournament->id, 'format' => 'knockout', 'draw_mode' => 'seeded', 'rules' => ScoringEngine::defaults(), 'groups' => [['name' => 'Peserta', 'teams' => ['A', 'B', 'C', 'D']]]];
+        $this->postJson('/api/v1/tiers', $payload)->assertUnprocessable()->assertJsonValidationErrors('seeds');
+        foreach ([['A', 'A'], ['A', 'unknown'], ['A', 'B', 'C'], ['A'], ['A', 'B', 'C', 'D', 'E'], ['top1' => 'A', 'top2' => 'B']] as $seeds) {
+            $this->postJson('/api/v1/tiers', [...$payload, 'seeds' => $seeds])->assertUnprocessable();
+        }
+        $this->postJson('/api/v1/tiers', [...$payload, 'format' => 'group', 'seeds' => ['A', 'B']])->assertUnprocessable();
+        $this->assertDatabaseCount('tiers', 0);
+    }
+
     public function test_sixty_four_team_random_draw_preserves_every_team_and_does_not_redraw_on_refresh(): void
     {
         $this->account();

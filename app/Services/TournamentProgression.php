@@ -12,7 +12,7 @@ class TournamentProgression
 {
     public function scheduleRevision(Tier $tier): string
     {
-        return hash('sha256', json_encode([$tier->format, $tier->groups, $tier->knockout['qualifiers'] ?? 2]));
+        return hash('sha256', json_encode([$tier->format, $tier->groups, $tier->knockout['qualifiers'] ?? 2, $tier->knockout['draw_mode'] ?? 'ordered', $tier->knockout['seeds'] ?? [], $tier->knockout['draw_slots'] ?? []]));
     }
 
     public function scheduledFixtures(Tier $tier): array
@@ -159,8 +159,52 @@ class TournamentProgression
         return $this->rounds($slots);
     }
 
+    public function seededSlots(array $teams, array $seeds): array
+    {
+        $size = 2;
+        while ($size < count($teams)) {
+            $size *= 2;
+        }
+        $slots = array_fill(0, $size, null);
+        $positions = [0, $size - 1, intdiv($size, 2), intdiv($size, 2) - 1];
+        foreach ($seeds as $rank => $team) {
+            $slots[$positions[$rank]] = ['label' => 'TOP '.($rank + 1), 'team' => $team];
+        }
+        $byes = $size - count($teams);
+        foreach (array_slice($positions, 0, count($seeds)) as $position) {
+            if ($byes > 0 && $slots[$position ^ 1] === null) {
+                $slots[$position ^ 1] = ['label' => 'BYE', 'team' => null];
+                $byes--;
+            }
+        }
+        $matches = intdiv($size, 2);
+        $spread = [0];
+        for ($step = intdiv($matches, 2); $step >= 1; $step = intdiv($step, 2)) {
+            $spread = [...$spread, ...array_map(fn (int $position): int => $position + $step, $spread)];
+        }
+        foreach ($spread as $match) {
+            if ($byes > 0 && $slots[$match * 2] === null && $slots[$match * 2 + 1] === null) {
+                $slots[$match * 2 + 1] = ['label' => 'BYE', 'team' => null];
+                $byes--;
+            }
+        }
+        $remaining = collect(array_values(array_diff($teams, $seeds)))->shuffle()->all();
+        $next = 0;
+        foreach ($slots as &$slot) {
+            if ($slot === null) {
+                $slot = ['label' => 'Peserta undian', 'team' => $remaining[$next++]];
+            }
+        }
+        unset($slot);
+
+        return $slots;
+    }
+
     private function directDraw(Tier $tier): array
     {
+        if (($tier->knockout['draw_mode'] ?? null) === 'seeded') {
+            return $this->rounds($tier->knockout['draw_slots']);
+        }
         $teams = $tier->groups[0]['teams'];
         $size = 2;
         while ($size < count($teams)) {
