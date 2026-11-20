@@ -19,6 +19,7 @@ Route::prefix('v1')->middleware(PadelAuth::class)->group(function (): void {
     Route::get('/tiers/{tier}/progression', [PadelController::class, 'progression']);
     Route::post('/tiers/{tier}/progression', [PadelController::class, 'configureProgression']);
     Route::post('/tiers/{tier}/knockout', [PadelController::class, 'confirmKnockout']);
+    Route::patch('/tiers/{tier}', [PadelController::class, 'updateTier']);
     Route::post('/tiers', [PadelController::class, 'tier']);
     Route::patch('/referees/{referee}', [PadelController::class, 'updateReferee']);
     Route::post('/referees', [PadelController::class, 'referee']);

@@ -68,7 +68,7 @@ class PadelController extends Controller
 
         return response()->json([
             'venues' => Venue::orderBy('name')->get(), 'user' => $request->user(), 'courts' => $courts, 'matches' => $matches,
-            'tournaments' => Tournament::orderByDesc('id')->get(), 'tiers' => Tier::all(),
+            'tournaments' => Tournament::orderByDesc('id')->get(), 'tiers' => Tier::all()->map(fn (Tier $tier): Tier => $tier->setAttribute('edit_revision', $this->tierRevision($tier))),
             'presets' => ScoringPreset::all(),
             'referees' => $admin ? User::where('role', 'referee')->get(['id', 'name', 'email']) : [],
             'server_time' => now()->toIso8601String(),
@@ -194,9 +194,13 @@ class PadelController extends Controller
         return response()->json(Tournament::create($data), 201);
     }
 
-    public function tier(Request $request, ScoringEngine $engine): JsonResponse
+    private function tierRevision(Tier $tier): string
     {
-        $this->admin($request);
+        return hash('sha256', json_encode([$tier->id, $tier->name, $tier->tournament_id, $tier->format, $tier->groups, $tier->rules, $tier->knockout]));
+    }
+
+    private function validateTier(Request $request): array
+    {
         $data = $request->validate([
             'tournament_id' => 'required|exists:tournaments,id', 'name' => 'required|string|max:100',
             'format' => 'required|in:group,direct,knockout', 'draw_mode' => 'sometimes|in:ordered,random', 'groups' => 'required|array|min:1|max:16',
@@ -214,32 +218,89 @@ class PadelController extends Controller
         }
         if ($data['format'] === 'knockout') {
             abort_unless(count($data['groups']) === 1, 422, 'Knockout langsung membutuhkan satu daftar berisi 2 sampai 16 pasangan.');
-            if (($data['draw_mode'] ?? 'ordered') === 'random') {
-                $data['groups'][0]['teams'] = collect($data['groups'][0]['teams'])->shuffle()->all();
-            }
         }
-        $drawMode = $data['draw_mode'] ?? 'ordered';
-        unset($data['draw_mode']);
-        $tier = DB::transaction(function () use ($data, $rules, $engine, $drawMode): Tier {
-            $tier = Tier::create([...$data, 'rules' => $rules]);
-            if ($tier->format === 'knockout') {
-                $tier->update(['knockout' => ['draw_mode' => $drawMode]]);
 
-                return $tier;
-            }
-            foreach ($data['groups'] as $group) {
-                $teams = $group['teams'];
-                for ($a = 0; $a < count($teams); $a++) {
-                    for ($b = $a + 1; $b < count($teams); $b++) {
-                        PadelMatch::create(['tier_id' => $tier->id, 'group_name' => $group['name'], 'team_a' => $teams[$a], 'team_b' => $teams[$b], 'rules' => $rules, 'state' => $engine->initial()]);
-                    }
+        return [...$data, 'rules' => $rules];
+    }
+
+    private function createTierMatches(Tier $tier, ScoringEngine $engine): void
+    {
+        if ($tier->format === 'knockout') {
+            return;
+        }
+        foreach ($tier->groups as $group) {
+            $teams = $group['teams'];
+            for ($a = 0; $a < count($teams); $a++) {
+                for ($b = $a + 1; $b < count($teams); $b++) {
+                    PadelMatch::create(['tier_id' => $tier->id, 'group_name' => $group['name'], 'team_a' => $teams[$a], 'team_b' => $teams[$b], 'rules' => $tier->rules, 'state' => $engine->initial()]);
                 }
             }
+        }
+    }
+
+    public function tier(Request $request, ScoringEngine $engine): JsonResponse
+    {
+        $this->admin($request);
+        $data = $this->validateTier($request);
+        $drawMode = $data['draw_mode'] ?? 'ordered';
+        unset($data['draw_mode']);
+        if ($data['format'] === 'knockout' && $drawMode === 'random') {
+            $data['groups'][0]['teams'] = collect($data['groups'][0]['teams'])->shuffle()->all();
+        }
+        $tier = DB::transaction(function () use ($data, $engine, $drawMode): Tier {
+            $tier = Tier::create($data);
+            if ($tier->format === 'knockout') {
+                $tier->update(['knockout' => ['draw_mode' => $drawMode]]);
+            }
+            $this->createTierMatches($tier, $engine);
 
             return $tier;
         });
 
         return response()->json($tier, 201);
+    }
+
+    public function updateTier(Request $request, Tier $tier, ScoringEngine $engine): JsonResponse
+    {
+        $this->admin($request);
+        $base = $request->validate(['name' => 'required|string|max:100', 'edit_revision' => 'required|string|size:64']);
+        $fullEdit = $request->hasAny(['tournament_id', 'format', 'rules', 'groups', 'draw_mode']);
+        $data = $fullEdit ? $this->validateTier($request) : ['name' => $base['name']];
+        DB::transaction(function () use ($tier, $engine, $base, $fullEdit, $data): void {
+            $locked = Tier::whereKey($tier->id)->lockForUpdate()->firstOrFail();
+            abort_unless($base['edit_revision'] === $this->tierRevision($locked), 409, 'Tier sudah berubah. Tutup form dan buka kembali untuk memuat data terbaru.');
+            if (! $fullEdit) {
+                $locked->update($data);
+
+                return;
+            }
+            $matches = PadelMatch::where('tier_id', $locked->id)->lockForUpdate()->get();
+            abort_if(($locked->knockout['confirmed_at'] ?? null) || $matches->contains(fn (PadelMatch $match): bool => $match->status !== 'scheduled' || $match->started_at !== null) || DB::table('score_events')->whereIn('padel_match_id', $matches->pluck('id'))->exists(), 409, 'Pertandingan sudah dimulai atau bagan sudah dikonfirmasi. Hanya nama tier yang dapat diubah.');
+            $drawMode = $data['draw_mode'] ?? ($locked->knockout['draw_mode'] ?? 'ordered');
+            $structuralChange = (int) $data['tournament_id'] !== $locked->tournament_id || $data['format'] !== $locked->format || $data['groups'] != $locked->groups || ($data['format'] === 'knockout' && $drawMode !== ($locked->knockout['draw_mode'] ?? 'ordered'));
+            $rulesChanged = $data['rules'] != $locked->rules;
+            unset($data['draw_mode']);
+            if ($structuralChange && $data['format'] === 'knockout' && $drawMode === 'random') {
+                $data['groups'][0]['teams'] = collect($data['groups'][0]['teams'])->shuffle()->all();
+            }
+            $locked->fill($data);
+            if ($structuralChange) {
+                $locked->knockout = $data['format'] === 'knockout' ? ['draw_mode' => $drawMode] : null;
+            }
+            $locked->save();
+            if ($structuralChange) {
+                PadelMatch::where('tier_id', $locked->id)->delete();
+                $this->createTierMatches($locked, $engine);
+            } elseif ($rulesChanged) {
+                foreach ($matches as $match) {
+                    $match->rules = $locked->rules;
+                    $match->version++;
+                    $match->save();
+                }
+            }
+        }, 3);
+
+        return response()->json($tier->fresh());
     }
 
     public function progression(Request $request, Tier $tier, TournamentProgression $progression): JsonResponse

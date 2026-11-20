@@ -13,7 +13,7 @@ class TournamentProgression
         if ($tier->format === 'knockout') {
             $rounds = $config['rounds'] ?? $this->directDraw($tier);
 
-            return ['revision' => hash('sha256', json_encode([$tier->groups, $rounds])), 'tie_orders' => (object) [], 'qualifiers' => 0, 'complete' => true, 'ready' => true, 'finished' => 0, 'total' => 0, 'groups' => [], 'rounds' => $rounds, 'confirmed_at' => $config['confirmed_at'] ?? null];
+            return ['revision' => hash('sha256', json_encode([$tier->groups, $rounds, $tier->rules])), 'tie_orders' => (object) [], 'qualifiers' => 0, 'complete' => true, 'ready' => true, 'finished' => 0, 'total' => 0, 'groups' => [], 'rounds' => $rounds, 'confirmed_at' => $config['confirmed_at'] ?? null];
         }
         $qualifiers = $config['qualifiers'] ?? 2;
         $matches = PadelMatch::where('tier_id', $tier->id)->where('stage', 'group')->orderBy('id')->get();
