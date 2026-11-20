@@ -56,7 +56,7 @@ class PadelController extends Controller
         return response()->json(['message' => 'Password diperbarui.']);
     }
 
-    public function data(Request $request): JsonResponse
+    public function data(Request $request, TournamentProgression $progression): JsonResponse
     {
         $admin = $request->user()->role === 'admin';
         $courts = Court::orderBy('id')->get();
@@ -70,6 +70,7 @@ class PadelController extends Controller
             'venues' => Venue::orderBy('name')->get(), 'user' => $request->user(), 'courts' => $courts, 'matches' => $matches,
             'tournaments' => Tournament::orderByDesc('id')->get(), 'tiers' => Tier::all()->map(fn (Tier $tier): Tier => $tier->setAttribute('edit_revision', $this->tierRevision($tier))),
             'presets' => ScoringPreset::all(),
+            'knockout_schedule' => $admin ? Tier::whereIn('format', ['group', 'knockout'])->get()->flatMap(fn (Tier $tier): array => $progression->scheduledFixtures($tier))->values() : [],
             'referees' => $admin ? User::where('role', 'referee')->get(['id', 'name', 'email']) : [],
             'server_time' => now()->toIso8601String(),
         ]);
@@ -329,10 +330,33 @@ class PadelController extends Controller
                 $group = collect($locked->groups)->firstWhere('name', $name);
                 abort_unless($group && count($order) === count($group['teams']) && count(array_unique($order)) === count($order) && ! array_diff($order, $group['teams']), 422, 'Urutan penentu harus memuat seluruh pasangan grup tepat satu kali.');
             }
-            $locked->update(['knockout' => ['qualifiers' => $data['qualifiers'], 'tie_orders' => $orders]]);
+            $schedule = ($locked->knockout['qualifiers'] ?? 2) === (int) $data['qualifiers'] ? ($locked->knockout['schedule'] ?? []) : [];
+            $locked->update(['knockout' => ['qualifiers' => $data['qualifiers'], 'tie_orders' => $orders, 'schedule' => $schedule]]);
         });
 
         return response()->json(['message' => 'Pengaturan kelolosan disimpan.']);
+    }
+
+    public function scheduleKnockout(Request $request, Tier $tier, TournamentProgression $progression): JsonResponse
+    {
+        $this->admin($request);
+        $data = $request->validate(['round' => 'required|integer|min:0', 'position' => 'required|integer|min:0', 'court_id' => 'present|nullable|exists:courts,id', 'revision' => 'required|string|size:64']);
+        DB::transaction(function () use ($tier, $data, $progression): void {
+            $locked = Tier::whereKey($tier->id)->lockForUpdate()->firstOrFail();
+            abort_unless(in_array($locked->format, ['group', 'knockout'], true), 422);
+            abort_unless($data['revision'] === $progression->scheduleRevision($locked), 409, 'Format knockout berubah. Periksa jadwal terbaru.');
+            $fixture = collect($progression->scheduledFixtures($locked))->first(fn (array $fixture): bool => $fixture['round'] === (int) $data['round'] && $fixture['position'] === (int) $data['position']);
+            abort_unless($fixture && ! $fixture['bye'], 409, 'Pertandingan sudah tersedia atau slot ini merupakan BYE. Periksa daftar terbaru.');
+            if ($data['court_id']) {
+                $court = Court::whereKey($data['court_id'])->lockForUpdate()->firstOrFail();
+                abort_unless($court->venue_id === Tournament::findOrFail($locked->tournament_id)->venue_id, 422, 'Pilih court yang berada di venue turnamen ini.');
+            }
+            $config = $locked->knockout ?? [];
+            $config['schedule'][$data['round'].':'.$data['position']] = $data['court_id'] ? (int) $data['court_id'] : null;
+            $locked->update(['knockout' => $config]);
+        }, 3);
+
+        return response()->json(['message' => 'Court knockout disimpan.']);
     }
 
     public function confirmKnockout(Request $request, Tier $tier, TournamentProgression $progression): JsonResponse
@@ -551,7 +575,7 @@ class PadelController extends Controller
                 $locked->status = 'review';
                 $locked->finished_at = null;
                 if ($tier->knockout) {
-                    $tier->update(['knockout' => ['qualifiers' => $tier->knockout['qualifiers'] ?? 2]]);
+                    $tier->update(['knockout' => ['qualifiers' => $tier->knockout['qualifiers'] ?? 2, 'schedule' => $tier->knockout['schedule'] ?? []]]);
                 }
             }
             $locked->version++;

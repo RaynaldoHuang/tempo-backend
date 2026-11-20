@@ -58,6 +58,90 @@ class TournamentProgressionTest extends TestCase
         $this->postJson("/api/v1/matches/{$match->id}/score", ['action' => 'confirm', 'version' => $match->version, 'command_id' => (string) Str::uuid()])->assertOk();
     }
 
+    public function test_future_knockout_courts_are_saved_before_groups_finish_and_carried_into_each_round(): void
+    {
+        $this->account();
+        $tier = $this->tier(2, false);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $url = "/api/v1/tiers/{$tier->id}";
+        $revision = (new TournamentProgression)->scheduleRevision($tier);
+        $this->getJson('/api/v1/data')->assertOk()->assertJsonCount(3, 'knockout_schedule')->assertJsonPath('knockout_schedule.0.team_a', null)->assertJsonPath('knockout_schedule.0.label_a', 'Juara Grup A')->assertJsonPath('knockout_schedule.2.label_a', 'Pemenang Semifinal 1');
+        foreach ([[0, 0], [1, 0]] as [$round, $position]) {
+            $this->postJson("{$url}/knockout-schedule", compact('round', 'position', 'revision') + ['court_id' => $court->id])->assertOk();
+        }
+        $this->assertSame(0, PadelMatch::where('stage', 'knockout')->count());
+        $this->postJson("{$url}/progression", ['qualifiers' => 2])->assertOk();
+        $this->assertSame($court->id, $tier->fresh()->knockout['schedule']['0:0']);
+        $this->getJson('/api/v1/data')->assertJsonPath('knockout_schedule.0.court_id', $court->id);
+        PadelMatch::where('tier_id', $tier->id)->update(['status' => 'finished']);
+        $this->postJson("{$url}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $matches = PadelMatch::where('stage', 'knockout')->orderBy('id')->get();
+        $this->assertSame($court->id, $matches[0]->court_id);
+        $this->assertSame(1, $matches[0]->queue_position);
+        $this->getJson('/api/v1/data')->assertJsonCount(1, 'knockout_schedule');
+        $this->postJson("{$url}/knockout-schedule", ['round' => 0, 'position' => 0, 'revision' => $revision, 'court_id' => $court->id])->assertConflict();
+        $this->confirm($matches[0]);
+        $this->confirm($matches[1]);
+        $final = PadelMatch::where('stage', 'knockout')->latest('id')->first();
+        $this->assertSame('Final · 1', $final->group_name);
+        $this->assertSame($court->id, $final->court_id);
+        $this->assertSame(2, $final->queue_position);
+        $this->getJson('/api/v1/data')->assertJsonCount(0, 'knockout_schedule');
+    }
+
+    public function test_future_knockout_schedule_checks_permissions_venue_byes_and_changed_draw(): void
+    {
+        $tier = $this->tier(3, false);
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $other = Court::create(['name' => 'Other court', 'venue_id' => Venue::create(['name' => 'Other venue'])->id]);
+        $url = "/api/v1/tiers/{$tier->id}/knockout-schedule";
+        $payload = ['round' => 0, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $court->id];
+        $this->postJson($url, $payload)->assertUnauthorized();
+        $this->account('referee');
+        $this->postJson($url, $payload)->assertForbidden();
+        $this->getJson('/api/v1/data')->assertJsonCount(0, 'knockout_schedule');
+        $this->account();
+        $this->postJson($url, [...$payload, 'court_id' => $other->id])->assertUnprocessable();
+        $this->postJson($url, [...$payload, 'position' => 1])->assertConflict();
+        $this->postJson($url, [...$payload, 'round' => 10])->assertConflict();
+        $this->postJson($url, $payload)->assertOk();
+        $this->postJson($url, [...$payload, 'court_id' => null])->assertOk();
+        $this->assertNull($tier->fresh()->knockout['schedule']['0:0']);
+        $this->postJson($url, $payload)->assertOk();
+        $this->postJson("/api/v1/tiers/{$tier->id}/progression", ['qualifiers' => 1])->assertOk();
+        $this->assertEmpty($tier->fresh()->knockout['schedule']);
+        $this->postJson($url, $payload)->assertConflict();
+    }
+
+    public function test_direct_knockout_future_rounds_keep_planned_courts_after_confirmation(): void
+    {
+        $this->account();
+        $tier = $this->directKnockout(4);
+        $court = Court::create(['name' => 'Final court', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $this->getJson('/api/v1/data')->assertJsonCount(3, 'knockout_schedule');
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout-schedule", ['round' => 1, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $court->id])->assertOk();
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        foreach (PadelMatch::where('tier_id', $tier->id)->get() as $match) {
+            $this->confirm($match);
+        }
+        $final = PadelMatch::where('tier_id', $tier->id)->latest('id')->first();
+        $this->assertSame('Final · 1', $final->group_name);
+        $this->assertSame($court->id, $final->court_id);
+        $this->getJson('/api/v1/data')->assertJsonCount(0, 'knockout_schedule');
+    }
+
+    public function test_deleted_planned_court_is_not_assigned_when_knockout_becomes_ready(): void
+    {
+        $this->account();
+        $tier = $this->tier();
+        $court = Court::create(['name' => 'Court 1', 'venue_id' => Tournament::find($tier->tournament_id)->venue_id]);
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout-schedule", ['round' => 0, 'position' => 0, 'revision' => (new TournamentProgression)->scheduleRevision($tier), 'court_id' => $court->id])->assertOk();
+        $this->deleteJson("/api/v1/courts/{$court->id}")->assertOk();
+        $this->getJson('/api/v1/data')->assertJsonPath('knockout_schedule.0.court_id', null);
+        $this->postJson("/api/v1/tiers/{$tier->id}/knockout", ['revision' => (new TournamentProgression)->overview($tier->fresh())['revision']])->assertOk();
+        $this->assertNull(PadelMatch::where('stage', 'knockout')->first()->court_id);
+    }
+
     public function test_cross_group_draw_advances_only_confirmed_results_and_produces_champion(): void
     {
         $this->account();
