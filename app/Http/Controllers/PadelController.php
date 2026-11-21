@@ -313,7 +313,7 @@ class PadelController extends Controller
                 $this->createTierMatches($locked, $engine);
             } elseif ($rulesChanged) {
                 foreach ($matches as $match) {
-                    $match->rules = $locked->rules;
+                    $match->rules = $match->stage === 'knockout' ? ($locked->knockout['rules'] ?? $locked->rules) : $locked->rules;
                     $match->version++;
                     $match->save();
                 }
@@ -329,6 +329,36 @@ class PadelController extends Controller
         abort_unless(in_array($tier->format, ['group', 'knockout'], true), 422, 'Tier ini tidak menggunakan bagan knockout.');
 
         return response()->json($progression->overview($tier));
+    }
+
+    public function knockoutRules(Request $request, Tier $tier): JsonResponse
+    {
+        $this->admin($request);
+        $revision = $request->validate(['edit_revision' => 'required|string|size:64'])['edit_revision'];
+        $rules = $this->validateRules($request);
+        $updated = DB::transaction(function () use ($tier, $revision, $rules): int {
+            $locked = Tier::whereKey($tier->id)->lockForUpdate()->firstOrFail();
+            abort_unless(in_array($locked->format, ['group', 'knockout'], true), 422, 'Tier ini tidak menggunakan knockout.');
+            abort_unless($revision === $this->tierRevision($locked), 409, 'Pengaturan berubah. Muat ulang lalu buka kembali aturan knockout.');
+            $locked->update(['knockout' => [...($locked->knockout ?? []), 'rules' => $rules]]);
+            $matches = PadelMatch::where('tier_id', $locked->id)->where('stage', 'knockout')->where('status', 'scheduled')->whereNull('started_at')->lockForUpdate()->get();
+            $updated = 0;
+            foreach ($matches as $match) {
+                if (DB::table('score_events')->where('padel_match_id', $match->id)->exists()) {
+                    continue;
+                }
+                if ($match->rules != $rules) {
+                    $match->rules = $rules;
+                    $match->version++;
+                    $match->save();
+                    $updated++;
+                }
+            }
+
+            return $updated;
+        }, 3);
+
+        return response()->json(['message' => 'Aturan knockout disimpan untuk pertandingan yang belum dimulai dan babak berikutnya.', 'updated_matches' => $updated]);
     }
 
     public function manualDraw(Request $request, Tier $tier, TournamentProgression $progression): JsonResponse
@@ -371,7 +401,7 @@ class PadelController extends Controller
                 Court::whereKey($courtId)->lockForUpdate()->firstOrFail();
             }
             $slots = array_map(fn (?string $team, int $i): array => ['label' => $team === null ? 'BYE' : 'Slot '.($i + 1), 'team' => $team], $data['slots'], array_keys($data['slots']));
-            $locked->update(['knockout' => ['draw_mode' => 'manual', 'draw_slots' => $slots, 'schedule' => []]]);
+            $locked->update(['knockout' => ['draw_mode' => 'manual', 'draw_slots' => $slots, 'schedule' => [], ...(isset($locked->knockout['rules']) ? ['rules' => $locked->knockout['rules']] : [])]]);
             PadelMatch::where('tier_id', $locked->id)->delete();
             CourtReservation::where('tier_id', $locked->id)->delete();
             $config = $locked->knockout;
@@ -415,7 +445,7 @@ class PadelController extends Controller
                 CourtReservation::where('tier_id', $locked->id)->delete();
             }
             $schedule = ($locked->knockout['qualifiers'] ?? 2) === (int) $data['qualifiers'] ? ($locked->knockout['schedule'] ?? []) : [];
-            $locked->update(['knockout' => ['qualifiers' => $data['qualifiers'], 'tie_orders' => $orders, 'schedule' => $schedule]]);
+            $locked->update(['knockout' => [...($locked->knockout ?? []), 'qualifiers' => $data['qualifiers'], 'tie_orders' => $orders, 'schedule' => $schedule]]);
         });
 
         return response()->json(['message' => 'Pengaturan kelolosan disimpan.']);
@@ -678,7 +708,7 @@ class PadelController extends Controller
                 $locked->status = 'review';
                 $locked->finished_at = null;
                 if ($tier->knockout) {
-                    $tier->update(['knockout' => ['qualifiers' => $tier->knockout['qualifiers'] ?? 2, 'schedule' => $tier->knockout['schedule'] ?? []]]);
+                    $tier->update(['knockout' => ['qualifiers' => $tier->knockout['qualifiers'] ?? 2, 'schedule' => $tier->knockout['schedule'] ?? [], ...(isset($tier->knockout['rules']) ? ['rules' => $tier->knockout['rules']] : [])]]);
                 }
             }
             $locked->version++;

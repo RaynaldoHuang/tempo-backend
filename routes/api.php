@@ -20,6 +20,7 @@ Route::prefix('v1')->middleware(PadelAuth::class)->group(function (): void {
     Route::post('/tiers/{tier}/progression', [PadelController::class, 'configureProgression']);
     Route::post('/tiers/{tier}/draw', [PadelController::class, 'manualDraw']);
     Route::post('/tiers/{tier}/knockout', [PadelController::class, 'confirmKnockout']);
+    Route::post('/tiers/{tier}/knockout-rules', [PadelController::class, 'knockoutRules']);
     Route::post('/tiers/{tier}/knockout-schedule', [PadelController::class, 'scheduleKnockout']);
     Route::patch('/tiers/{tier}', [PadelController::class, 'updateTier']);
     Route::post('/tiers', [PadelController::class, 'tier']);

@@ -55,7 +55,7 @@ class TournamentProgression
             return null;
         }
 
-        return new PadelMatch(['id' => -$reservation->id, 'reservation_id' => $reservation->id, 'tier_id' => $tier->id, 'court_id' => $reservation->court_id, 'queue_position' => $reservation->queue_position, 'group_name' => $fixture['round_name'].' · '.$fixture['number'], 'team_a' => $fixture['team_a'] ?? $fixture['label_a'], 'team_b' => $fixture['team_b'] ?? $fixture['label_b'], 'status' => 'waiting', 'stage' => 'knockout', 'version' => $reservation->version, 'rules' => $tier->rules, 'state' => (new ScoringEngine)->initial()]);
+        return new PadelMatch(['id' => -$reservation->id, 'reservation_id' => $reservation->id, 'tier_id' => $tier->id, 'court_id' => $reservation->court_id, 'queue_position' => $reservation->queue_position, 'group_name' => $fixture['round_name'].' · '.$fixture['number'], 'team_a' => $fixture['team_a'] ?? $fixture['label_a'], 'team_b' => $fixture['team_b'] ?? $fixture['label_b'], 'status' => 'waiting', 'stage' => 'knockout', 'version' => $reservation->version, 'rules' => $tier->knockout['rules'] ?? $tier->rules, 'state' => (new ScoringEngine)->initial()]);
     }
 
     public function canEditDraw(Tier $tier): bool
@@ -314,7 +314,7 @@ class TournamentProgression
                 if (! $node['match_id']) {
                     $reservation = CourtReservation::where('tier_id', $tier->id)->where('round', $r)->where('position', $i)->first();
                     $court = Court::whereKey($config['schedule']["{$r}:{$i}"] ?? null)->where('venue_id', Tournament::findOrFail($tier->tournament_id)->venue_id)->lockForUpdate()->first();
-                    $match = PadelMatch::create(['tier_id' => $tier->id, 'stage' => 'knockout', 'group_name' => $round['name'].' · '.($i + 1), 'team_a' => $node['a']['team'], 'team_b' => $node['b']['team'], 'rules' => $tier->rules, 'state' => (new ScoringEngine)->initial()]);
+                    $match = PadelMatch::create(['tier_id' => $tier->id, 'stage' => 'knockout', 'group_name' => $round['name'].' · '.($i + 1), 'team_a' => $node['a']['team'], 'team_b' => $node['b']['team'], 'rules' => $tier->knockout['rules'] ?? $tier->rules, 'state' => (new ScoringEngine)->initial()]);
                     if ($court) {
                         $match->update(['court_id' => $court->id, 'queue_position' => $reservation?->queue_position ?? (new CourtQueue)->nextPosition($court->id)]);
                     }
