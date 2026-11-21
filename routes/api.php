@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\PadelController;
+use App\Http\Controllers\TournamentReportController;
 use App\Http\Middleware\PadelAuth;
 use Illuminate\Support\Facades\Route;
 
@@ -9,6 +10,7 @@ Route::get('/v1/board', [PadelController::class, 'board']);
 Route::post('/v1/login', [PadelController::class, 'login'])->middleware('throttle:10,1');
 Route::prefix('v1')->middleware(PadelAuth::class)->group(function (): void {
     Route::get('/data', [PadelController::class, 'data']);
+    Route::get('/reports/tournament', TournamentReportController::class);
     Route::post('/logout', [PadelController::class, 'logout']);
     Route::post('/password', [PadelController::class, 'password']);
     Route::post('/presets', [PadelController::class, 'preset']);
